@@ -1,0 +1,697 @@
+"""Infill an uploaded shape (DXF, SVG, or AI/PDF) with the screenwall hole pattern.
+
+Takes arbitrary closed outlines — letters, logos, any polygon, including
+shapes with interior voids (the counter of an "O", for example) and multiple
+disjoint graphics in one file (a whole word) — and fills them with the same
+straight / staggered perforation grid the panel generator uses, honoring hole
+diameter, pitch, stagger angle, and an edge-clearance margin.
+
+Geometry model
+--------------
+A shape is a list of *rings*: closed point loops in inches, y-up. Insideness
+uses the even-odd rule across all rings, so interior rings are voids and
+multiple disjoint outlines work naturally. A hole center is kept when it is
+inside (even-odd) AND its distance to every boundary segment is at least
+``margin + hole_radius`` — the exact "circle fits fully inside with the
+requested clearance" condition for any polygon, convex or not.
+
+Edge nudge: a hole that ALMOST fits may optionally slide a small, capped
+distance inward (never resized) until it clears the outline — so glyph edges
+read cleanly instead of dropping a whole row of boundary holes.
+
+No shapely/GEOS: containment and clearance are computed with numpy
+(already required by ezdxf). SVG parsing uses ``svgelements`` (pure Python);
+AI/PDF parsing is a best-effort stdlib content-stream reader.
+"""
+from __future__ import annotations
+
+import io
+import math
+import re as _re
+import zlib
+from dataclasses import dataclass, field
+
+import ezdxf
+import numpy as np
+from ezdxf import path as _ezpath
+from ezdxf import recover as _ezrecover
+
+from screenwall_generator import _hole_centers
+
+# Flattening tolerances (inches): max sag for curve → polyline conversion.
+FLATTEN_DISTANCE_IN = 0.005
+# Max chord length when sampling SVG/PDF curves, in final (scaled) inches.
+CHORD_IN = 0.02
+# Endpoint snap tolerance when joining open DXF entities into loops (inches).
+JOIN_TOL_IN = 0.005
+# Guard rails so a huge graphic with a tiny pitch cannot melt the server.
+MAX_GRID_CANDIDATES = 250_000
+MAX_HOLES = 60_000
+
+# Unit conversions.
+SVG_PX_PER_IN = 96.0   # SVG user units are CSS pixels
+PDF_PT_PER_IN = 72.0   # PDF / AI user units are points
+MM_PER_IN = 25.4
+
+_DXF_PATH_TYPES = {
+    "LWPOLYLINE", "POLYLINE", "LINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE",
+}
+
+
+@dataclass
+class ShapeGeometry:
+    """Closed rings (inches, y-up, translated to the origin) + import notes."""
+    rings: list[list[tuple[float, float]]]
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def bbox(self):
+        xs = [x for r in self.rings for x, _ in r]
+        ys = [y for r in self.rings for _, y in r]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    @property
+    def extents(self):
+        x0, y0, x1, y1 = self.bbox
+        return (x1 - x0, y1 - y0)
+
+
+@dataclass
+class InfillResult:
+    holes: list[tuple[float, float]]
+    nudged: int          # how many of `holes` were shifted to fit
+    dropped: int         # candidates near the edge that could not fit
+
+
+# ---------------------------------------------------------------------------
+# Ring helpers
+# ---------------------------------------------------------------------------
+def _ring_area(ring) -> float:
+    a = 0.0
+    n = len(ring)
+    for i in range(n):
+        x0, y0 = ring[i]
+        x1, y1 = ring[(i + 1) % n]
+        a += x0 * y1 - x1 * y0
+    return a / 2.0
+
+
+def _dedupe_ring(ring, tol=1e-9):
+    out = []
+    for p in ring:
+        if not out or math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > tol:
+            out.append((float(p[0]), float(p[1])))
+    if len(out) > 1 and math.hypot(out[0][0] - out[-1][0], out[0][1] - out[-1][1]) <= tol:
+        out.pop()
+    return out
+
+
+def _clean_rings(rings, min_area=1e-6):
+    cleaned = []
+    for ring in rings:
+        r = _dedupe_ring(ring)
+        if len(r) >= 3 and abs(_ring_area(r)) > min_area:
+            cleaned.append(r)
+    return cleaned
+
+
+def _normalize_rings(rings):
+    """Translate so the shape's bbox min corner sits at the origin."""
+    if not rings:
+        return rings
+    min_x = min(x for r in rings for x, _ in r)
+    min_y = min(y for r in rings for _, y in r)
+    return [[(x - min_x, y - min_y) for x, y in r] for r in rings]
+
+
+def scale_rings(rings, factor: float):
+    return [[(x * factor, y * factor) for x, y in r] for r in rings]
+
+
+def strip_bounding_rect(shape: ShapeGeometry) -> tuple[ShapeGeometry, bool]:
+    """Drop one outer ring that spans (almost) the whole bbox.
+
+    AI/PDF and some SVG exports include an artboard/background rectangle that
+    would flip the even-odd fill of everything inside it. Only removes a ring
+    when other rings remain.
+    """
+    if len(shape.rings) < 2:
+        return shape, False
+    x0, y0, x1, y1 = shape.bbox
+    w, h = max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
+    for i, ring in enumerate(shape.rings):
+        rx0 = min(x for x, _ in ring); rx1 = max(x for x, _ in ring)
+        ry0 = min(y for _, y in ring); ry1 = max(y for _, y in ring)
+        covers = (rx1 - rx0) >= 0.99 * w and (ry1 - ry0) >= 0.99 * h
+        boxy = abs(abs(_ring_area(ring)) - (rx1 - rx0) * (ry1 - ry0)) <= 0.02 * w * h
+        if covers and boxy:
+            rest = shape.rings[:i] + shape.rings[i + 1:]
+            return ShapeGeometry(_normalize_rings(rest), list(shape.warnings)), True
+    return shape, False
+
+
+def _join_open_chains(chains, tol=JOIN_TOL_IN):
+    """Greedily join open polylines end-to-end into closed rings.
+
+    Real-world DXF text/logos often arrive exploded into LINE/ARC/SPLINE
+    fragments; this stitches them back into loops. Returns (rings, leftover).
+    """
+    pool = [list(c) for c in chains if len(c) >= 2]
+    rings, leftover = [], 0
+    while pool:
+        chain = pool.pop()
+        grew = True
+        while grew:
+            head, tail = chain[0], chain[-1]
+            if math.hypot(head[0] - tail[0], head[1] - tail[1]) <= tol and len(chain) >= 3:
+                break
+            grew = False
+            for i, cand in enumerate(pool):
+                c0, c1 = cand[0], cand[-1]
+                if math.hypot(tail[0] - c0[0], tail[1] - c0[1]) <= tol:
+                    chain += cand[1:]
+                elif math.hypot(tail[0] - c1[0], tail[1] - c1[1]) <= tol:
+                    chain += cand[-2::-1]
+                elif math.hypot(head[0] - c1[0], head[1] - c1[1]) <= tol:
+                    chain = cand[:-1] + chain
+                elif math.hypot(head[0] - c0[0], head[1] - c0[1]) <= tol:
+                    chain = cand[::-1][:-1] + chain
+                else:
+                    continue
+                pool.pop(i)
+                grew = True
+                break
+        head, tail = chain[0], chain[-1]
+        if math.hypot(head[0] - tail[0], head[1] - tail[1]) <= tol and len(chain) >= 4:
+            rings.append(chain[:-1])
+        else:
+            leftover += 1
+    return rings, leftover
+
+
+# ---------------------------------------------------------------------------
+# DXF import
+# ---------------------------------------------------------------------------
+def rings_from_dxf(data: bytes, unit_scale: float = 1.0) -> ShapeGeometry:
+    """Extract closed rings from DXF bytes.
+
+    ``unit_scale`` multiplies drawing units into inches (1.0 for inch
+    drawings, 1/25.4 for millimeter drawings).
+    """
+    doc, _auditor = _ezrecover.read(io.BytesIO(data))
+    msp = doc.modelspace()
+
+    closed, open_chains, skipped = [], [], {}
+    for e in msp:
+        kind = e.dxftype()
+        if kind not in _DXF_PATH_TYPES:
+            skipped[kind] = skipped.get(kind, 0) + 1
+            continue
+        try:
+            p = _ezpath.make_path(e)
+        except Exception:
+            skipped[kind] = skipped.get(kind, 0) + 1
+            continue
+        pts = [(v.x * unit_scale, v.y * unit_scale)
+               for v in p.flattening(distance=FLATTEN_DISTANCE_IN / max(unit_scale, 1e-9))]
+        pts = _dedupe_ring(pts)
+        if len(pts) < 2:
+            continue
+        if p.is_closed and len(pts) >= 3:
+            closed.append(pts)
+        else:
+            open_chains.append(pts)
+
+    warnings = []
+    joined, leftover = _join_open_chains(open_chains)
+    if leftover:
+        warnings.append(
+            f"{leftover} open path(s) could not be joined into closed loops and were ignored."
+        )
+    for kind, count in sorted(skipped.items()):
+        warnings.append(
+            f"Skipped {count} × {kind} entit{'y' if count == 1 else 'ies'} "
+            "(only line/arc/polyline/spline geometry is used — explode blocks and text to outlines)."
+        )
+
+    rings = _clean_rings(closed + joined)
+    if not rings:
+        raise ValueError(
+            "No closed outlines found in the DXF. The shape must be closed "
+            "polylines/splines/circles (explode text and blocks first)."
+        )
+    return ShapeGeometry(_normalize_rings(rings), warnings)
+
+
+# ---------------------------------------------------------------------------
+# SVG import
+# ---------------------------------------------------------------------------
+def rings_from_svg(data: bytes, unit_scale: float = 1.0 / SVG_PX_PER_IN) -> ShapeGeometry:
+    """Extract closed rings from SVG bytes.
+
+    ``unit_scale`` multiplies SVG user units into inches (default treats user
+    units as CSS px at 96/inch). The y-axis is flipped to y-up for DXF.
+    """
+    from svgelements import SVG, Path as SvgPath, Shape, Text, Close, Line, Move
+
+    svg = SVG.parse(io.BytesIO(data), reify=True, ppi=SVG_PX_PER_IN)
+
+    closed, open_chains, warnings = [], [], []
+    text_count = 0
+    for element in svg.elements():
+        if isinstance(element, Text):
+            text_count += 1
+            continue
+        if not isinstance(element, Shape):
+            continue
+        try:
+            path = element if isinstance(element, SvgPath) else SvgPath(element)
+            path.reify()
+        except Exception:
+            continue
+        for sub in path.as_subpaths():
+            sub = SvgPath(sub)
+            pts = []
+            is_closed = False
+            for seg in sub:
+                if isinstance(seg, Move):
+                    if seg.end is not None:
+                        pts.append((seg.end.x, seg.end.y))
+                    continue
+                if isinstance(seg, Close):
+                    is_closed = True
+                    continue
+                if seg.end is None or seg.start is None:
+                    continue
+                if isinstance(seg, Line):
+                    pts.append((seg.end.x, seg.end.y))
+                    continue
+                try:
+                    length = seg.length(error=1e-4)
+                except Exception:
+                    length = 0.0
+                n = max(2, int(math.ceil((length * unit_scale) / CHORD_IN)))
+                for i in range(1, n + 1):
+                    p = seg.point(i / n)
+                    pts.append((p.x, p.y))
+            # inches, y-up
+            pts = _dedupe_ring([(x * unit_scale, -y * unit_scale) for x, y in pts])
+            if len(pts) < 2:
+                continue
+            if not is_closed and len(pts) >= 3:
+                if math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) <= JOIN_TOL_IN:
+                    is_closed = True
+            if is_closed and len(pts) >= 3:
+                closed.append(pts)
+            else:
+                open_chains.append(pts)
+
+    if text_count:
+        warnings.append(
+            f"Skipped {text_count} live <text> element(s) — convert text to outlines/paths "
+            "in your design tool before exporting."
+        )
+    joined, leftover = _join_open_chains(open_chains)
+    if leftover:
+        warnings.append(
+            f"{leftover} open path(s) could not be joined into closed loops and were ignored."
+        )
+
+    rings = _clean_rings(closed + joined)
+    if not rings:
+        raise ValueError(
+            "No closed outlines found in the SVG. The shape must be closed paths "
+            "(convert text/strokes to outlines first)."
+        )
+    return ShapeGeometry(_normalize_rings(rings), warnings)
+
+
+# ---------------------------------------------------------------------------
+# AI / PDF import (best effort)
+# ---------------------------------------------------------------------------
+_PDF_TOKEN = _re.compile(
+    rb"(-?(?:\d+\.?\d*|\.\d+))"          # number
+    rb"|/[^\s/<>\[\]()%]*"               # name (skipped)
+    rb"|(BT.*?ET)"                        # text blocks (skipped)
+    rb"|(\((?:\\.|[^\\()])*\))"          # string (skipped)
+    rb"|(<[^>]*>)"                        # hex string / dict-ish (skipped)
+    rb"|(\[[^\]]*\])"                     # array (skipped)
+    rb"|([A-Za-z'\"*]{1,3})",            # operator
+    _re.DOTALL,
+)
+_PDF_PATH_HINT = _re.compile(rb"\b(re|m|l|c|v|y)\b")
+
+
+def _mostly_text(blob: bytes) -> bool:
+    sample = blob[:4096]
+    if not sample:
+        return False
+    printable = sum(1 for b in sample if 32 <= b < 127 or b in (9, 10, 13))
+    return printable / len(sample) > 0.9
+
+
+def _pdf_content_streams(data: bytes):
+    """Yield candidate vector content streams from raw PDF/AI bytes."""
+    for m in _re.finditer(rb"stream\r?\n", data):
+        start = m.end()
+        end = data.find(b"endstream", start)
+        if end < 0:
+            continue
+        blob = data[start:end].rstrip(b"\r\n")
+        try:
+            candidate = zlib.decompress(blob)
+        except zlib.error:
+            candidate = blob
+        if _mostly_text(candidate) and _PDF_PATH_HINT.search(candidate):
+            yield candidate
+
+
+def _flatten_cubic(p0, p1, p2, p3, unit_scale):
+    poly_len = (
+        math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        + math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+        + math.hypot(p3[0] - p2[0], p3[1] - p2[1])
+    )
+    n = min(64, max(2, int(math.ceil((poly_len * unit_scale) / CHORD_IN))))
+    pts = []
+    for i in range(1, n + 1):
+        t = i / n
+        u = 1.0 - t
+        x = (u**3) * p0[0] + 3 * (u**2) * t * p1[0] + 3 * u * (t**2) * p2[0] + (t**3) * p3[0]
+        y = (u**3) * p0[1] + 3 * (u**2) * t * p1[1] + 3 * u * (t**2) * p2[1] + (t**3) * p3[1]
+        pts.append((x, y))
+    return pts
+
+
+def rings_from_pdf(data: bytes, unit_scale: float = 1.0 / PDF_PT_PER_IN) -> ShapeGeometry:
+    """Extract closed vector paths from PDF or PDF-compatible Adobe ``.ai`` bytes.
+
+    Best-effort content-stream reader: follows m/l/c/v/y/re/h path construction
+    with q/Q/cm transforms, keeps painted paths (fill or stroke), and discards
+    pure clipping paths (``W n``) and text. PDF user space is points (72/in),
+    already y-up. Save Illustrator files with "Create PDF Compatible File" on
+    (the default) or use Save As → PDF.
+    """
+    closed, open_chains = [], []
+    paint_ops = {b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"S", b"s", b"n"}
+    close_first = {b"b", b"b*", b"s"}
+
+    found_stream = False
+    for content in _pdf_content_streams(data):
+        found_stream = True
+        ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        stack: list = []
+        nums: list[float] = []
+        subpaths: list[tuple[list, bool]] = []
+        cur: list = []
+        cur_closed = False
+        clip_pending = False
+
+        def xf(x, y, _m=None):
+            a, b, c, d, e, f = _m if _m is not None else ctm
+            return (a * x + c * y + e, b * x + d * y + f)
+
+        def commit_cur():
+            nonlocal cur, cur_closed
+            if len(cur) >= 2:
+                subpaths.append((cur, cur_closed))
+            cur, cur_closed = [], False
+
+        for tok in _PDF_TOKEN.finditer(content):
+            num, _txt, _s, _hx, _arr, op = tok.group(1), tok.group(2), tok.group(3), tok.group(4), tok.group(5), tok.group(6)
+            if num is not None:
+                try:
+                    nums.append(float(num))
+                except ValueError:
+                    nums = []
+                continue
+            if op is None:
+                nums = []
+                continue
+            try:
+                if op == b"q":
+                    stack.append(ctm)
+                elif op == b"Q":
+                    ctm = stack.pop() if stack else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                elif op == b"cm" and len(nums) >= 6:
+                    a, b, c, d, e, f = nums[-6:]
+                    A, B, C, D, E, F = ctm
+                    ctm = (a * A + b * C, a * B + b * D,
+                           c * A + d * C, c * B + d * D,
+                           e * A + f * C + E, e * B + f * D + F)
+                elif op == b"m" and len(nums) >= 2:
+                    commit_cur()
+                    cur = [xf(nums[-2], nums[-1])]
+                elif op == b"l" and len(nums) >= 2 and cur:
+                    cur.append(xf(nums[-2], nums[-1]))
+                elif op in (b"c", b"v", b"y") and cur:
+                    p0 = cur[-1]
+                    if op == b"c" and len(nums) >= 6:
+                        p1 = xf(nums[-6], nums[-5]); p2 = xf(nums[-4], nums[-3]); p3 = xf(nums[-2], nums[-1])
+                    elif op == b"v" and len(nums) >= 4:
+                        p1 = p0; p2 = xf(nums[-4], nums[-3]); p3 = xf(nums[-2], nums[-1])
+                    elif op == b"y" and len(nums) >= 4:
+                        p1 = xf(nums[-4], nums[-3]); p3 = xf(nums[-2], nums[-1]); p2 = p3
+                    else:
+                        nums = []
+                        continue
+                    cur.extend(_flatten_cubic(p0, p1, p2, p3, unit_scale))
+                elif op == b"re" and len(nums) >= 4:
+                    commit_cur()
+                    x, y, w, h = nums[-4:]
+                    subpaths.append(([xf(x, y), xf(x + w, y), xf(x + w, y + h), xf(x, y + h)], True))
+                elif op == b"h":
+                    cur_closed = True
+                elif op in (b"W", b"W*"):
+                    clip_pending = True
+                elif op in paint_ops:
+                    if op in close_first:
+                        cur_closed = True
+                    commit_cur()
+                    if op == b"n" and clip_pending:
+                        subpaths = []          # pure clipping path — discard
+                    elif op != b"n":
+                        for pts, was_closed in subpaths:
+                            scaled = _dedupe_ring([(x * unit_scale, y * unit_scale) for x, y in pts])
+                            if len(scaled) < 2:
+                                continue
+                            if (was_closed or op not in (b"S",)) and len(scaled) >= 3:
+                                closed.append(scaled)
+                            else:
+                                open_chains.append(scaled)
+                        subpaths = []
+                    else:
+                        subpaths = []
+                    clip_pending = False
+            finally:
+                nums = []
+
+    if not found_stream:
+        raise ValueError(
+            "No vector content found. Save the Illustrator file with "
+            "'Create PDF Compatible File' checked, use Save As → PDF, or export SVG."
+        )
+
+    warnings = [
+        "AI/PDF import is best-effort — check the preview. For exact results export "
+        "SVG from Illustrator (text converted to outlines)."
+    ]
+    joined, leftover = _join_open_chains(open_chains)
+    if leftover:
+        warnings.append(
+            f"{leftover} open path(s) could not be joined into closed loops and were ignored."
+        )
+    rings = _clean_rings(closed + joined)
+    if not rings:
+        raise ValueError(
+            "No closed outlines found in the AI/PDF. Convert text/strokes to outlines "
+            "and make sure shapes are filled paths, or export SVG instead."
+        )
+    return ShapeGeometry(_normalize_rings(rings), warnings)
+
+
+def load_shape(data: bytes, filename: str, unit_scale: float | None = None) -> ShapeGeometry:
+    """Dispatch on extension. ``unit_scale`` = drawing/user units → inches."""
+    name = (filename or "").lower()
+    if name.endswith(".svg"):
+        return rings_from_svg(data, 1.0 / SVG_PX_PER_IN if unit_scale is None else unit_scale)
+    if name.endswith(".dxf"):
+        return rings_from_dxf(data, 1.0 if unit_scale is None else unit_scale)
+    if name.endswith(".ai") or name.endswith(".pdf"):
+        return rings_from_pdf(data, 1.0 / PDF_PT_PER_IN if unit_scale is None else unit_scale)
+    if name.endswith(".eps"):
+        raise ValueError(
+            "EPS (PostScript) is not supported. From Illustrator use "
+            "File → Save As → SVG or PDF (or .ai with PDF compatibility, the default)."
+        )
+    raise ValueError(f"Unsupported file type: {filename} (upload .dxf, .svg, .ai, or .pdf)")
+
+
+# ---------------------------------------------------------------------------
+# Infill
+# ---------------------------------------------------------------------------
+def _segment_arrays(rings):
+    x0, y0, x1, y1 = [], [], [], []
+    for ring in rings:
+        n = len(ring)
+        for i in range(n):
+            ax, ay = ring[i]
+            bx, by = ring[(i + 1) % n]
+            x0.append(ax); y0.append(ay); x1.append(bx); y1.append(by)
+    return (np.asarray(x0), np.asarray(y0), np.asarray(x1), np.asarray(y1))
+
+
+def _classify_centers(pts, segs):
+    """(inside, min_dist, nearest_x, nearest_y) for each point vs the boundary."""
+    sx0, sy0, sx1, sy1 = segs
+    n_seg = len(sx0)
+    dx = sx1 - sx0
+    dy = sy1 - sy0
+    seg_len2 = np.maximum(dx * dx + dy * dy, 1e-18)
+
+    inside = np.zeros(len(pts), dtype=bool)
+    min_d = np.zeros(len(pts))
+    near_x = np.zeros(len(pts))
+    near_y = np.zeros(len(pts))
+    # Chunked broadcasting keeps peak memory bounded (~8 arrays × chunk × n_seg).
+    chunk = max(64, int(2_000_000 / max(n_seg, 1)))
+    for start in range(0, len(pts), chunk):
+        px = pts[start:start + chunk, 0][:, None]   # (P,1)
+        py = pts[start:start + chunk, 1][:, None]
+        # Even-odd ray cast toward +x.
+        straddle = (sy0[None, :] > py) != (sy1[None, :] > py)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_at = sx0[None, :] + (py - sy0[None, :]) * dx[None, :] / np.where(
+                dy[None, :] == 0.0, np.inf, dy[None, :]
+            )
+        crossings = np.sum(straddle & (px < x_at), axis=1)
+        # Min distance point → segment (and the nearest boundary point).
+        t = ((px - sx0[None, :]) * dx[None, :] + (py - sy0[None, :]) * dy[None, :]) / seg_len2[None, :]
+        t = np.clip(t, 0.0, 1.0)
+        qx = sx0[None, :] + t * dx[None, :]
+        qy = sy0[None, :] + t * dy[None, :]
+        d2 = (px - qx) ** 2 + (py - qy) ** 2
+        idx = np.argmin(d2, axis=1)
+        rows = np.arange(d2.shape[0])
+        sl = slice(start, start + d2.shape[0])
+        inside[sl] = (crossings % 2) == 1
+        min_d[sl] = np.sqrt(d2[rows, idx])
+        near_x[sl] = qx[rows, idx]
+        near_y[sl] = qy[rows, idx]
+    return inside, min_d, near_x, near_y
+
+
+def _try_nudge(px, py, segs, clearance, budget):
+    """Slide a point inward (small, capped steps) until the hole clears.
+
+    Returns the new (x, y) or None. Direction is always along the local inward
+    normal (away from the nearest boundary point when inside, toward and past
+    it when outside). Re-classifies after each step so narrow strokes where
+    both sides conflict are rejected, not force-fitted.
+    """
+    moved = 0.0
+    for _ in range(4):
+        inside, d, qx, qy = _classify_centers(np.array([[px, py]]), segs)
+        if inside[0] and d[0] >= clearance - 1e-9:
+            return (px, py)
+        vx, vy = px - qx[0], py - qy[0]
+        norm = math.hypot(vx, vy)
+        if norm < 1e-12:
+            return None  # exactly on the outline — no stable normal
+        if not inside[0]:
+            vx, vy = -vx, -vy
+        signed = d[0] if inside[0] else -d[0]
+        need = (clearance - signed) + 1e-6
+        step = min(need, budget - moved)
+        if step <= 1e-9:
+            return None
+        px += vx / norm * step
+        py += vy / norm * step
+        moved += step
+    inside, d, _, _ = _classify_centers(np.array([[px, py]]), segs)
+    return (px, py) if inside[0] and d[0] >= clearance - 1e-9 else None
+
+
+def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
+                        pattern: str, stagger_angle: float, margin: float,
+                        nudge_max: float = 0.0) -> InfillResult:
+    """Hole grid over the shape bbox, filtered to holes that fully fit inside.
+
+    Same grid math and margin semantics as the panel face (`_hole_centers`):
+    ``margin`` is the clearance from the boundary to the hole *edge*.
+
+    ``nudge_max`` (inches) lets an almost-fitting boundary hole slide up to
+    that distance inward — same diameter, slightly off-grid — so letter edges
+    stay readable. Nudged holes are rejected if they would come within one
+    hole diameter (center-to-center, +5%) of another hole.
+    """
+    if hole_dia <= 0 or pitch <= 0:
+        raise ValueError("hole diameter and pitch must be positive")
+    if pitch < hole_dia:
+        raise ValueError("pitch must be >= hole diameter (holes would overlap)")
+    x0, y0, x1, y1 = shape.bbox
+    w, h = x1 - x0, y1 - y0
+
+    # Candidate-count guard before allocating anything.
+    est = (w / pitch + 2.0) * (h / (pitch * math.sin(math.radians(stagger_angle)) or pitch) + 2.0)
+    if pattern == "staggered":
+        est *= 2.0
+    if est > MAX_GRID_CANDIDATES:
+        raise ValueError(
+            f"Pattern would generate ~{int(est):,} candidate holes "
+            f"(limit {MAX_GRID_CANDIDATES:,}). Increase the pitch or shrink the shape."
+        )
+
+    raw = _hole_centers(x0, y0, w, h, hole_dia, pitch, pattern, stagger_angle, margin)
+    if not raw:
+        return InfillResult([], 0, 0)
+    segs = _segment_arrays(shape.rings)
+    clearance = margin + hole_dia / 2.0
+
+    pts = np.asarray(raw, dtype=float)
+    inside, min_d, _, _ = _classify_centers(pts, segs)
+    fits = inside & (min_d >= clearance)
+    holes = [(float(x), float(y)) for (x, y), ok in zip(raw, fits) if ok]
+
+    nudged, dropped = 0, 0
+    if nudge_max > 0.0:
+        signed = np.where(inside, min_d, -min_d)
+        needed = clearance - signed
+        eligible = (~fits) & (needed <= nudge_max + 1e-9)
+        min_cc = hole_dia * 1.05  # never let a nudged hole overlap a neighbor
+        for i in np.nonzero(eligible)[0]:
+            moved = _try_nudge(pts[i, 0], pts[i, 1], segs, clearance, nudge_max)
+            if moved is None:
+                dropped += 1
+                continue
+            mx, my = moved
+            if any((mx - hx) ** 2 + (my - hy) ** 2 < min_cc * min_cc for hx, hy in holes):
+                dropped += 1
+                continue
+            holes.append((mx, my))
+            nudged += 1
+        dropped += int(np.sum((~fits) & (needed > nudge_max + 1e-9) & (signed > -clearance)))
+    if len(holes) > MAX_HOLES:
+        raise ValueError(
+            f"Pattern produced {len(holes):,} holes (limit {MAX_HOLES:,}). "
+            "Increase the pitch or shrink the shape."
+        )
+    return InfillResult(holes, nudged, dropped)
+
+
+# ---------------------------------------------------------------------------
+# Output document
+# ---------------------------------------------------------------------------
+def build_infill_document(shape: ShapeGeometry, holes, hole_dia: float):
+    """ezdxf doc matching panel conventions: outline on `cut`, holes on `holes`."""
+    doc = ezdxf.new(dxfversion="R2010")
+    doc.units = 1  # inches
+    msp = doc.modelspace()
+    for name, color in [("cut", 1), ("holes", 2)]:
+        if name not in doc.layers:
+            doc.layers.add(name=name, color=color)
+    for ring in shape.rings:
+        msp.add_lwpolyline(ring, close=True, dxfattribs={"layer": "cut"})
+    for x, y in holes:
+        msp.add_circle((x, y), hole_dia / 2.0, dxfattribs={"layer": "holes"})
+    return doc

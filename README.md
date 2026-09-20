@@ -17,6 +17,7 @@ This milestone is intended for **team testing over time**, not production sign-o
 | CSV import → ZIP of panel DXFs | Sheet nesting (`nest_panels` stub) |
 | L4S, J4S, L2TB/J2TB, L2LR/J2LR, MIX, RT4S, RT4J | Duplicate `panel_id` detection in UI |
 | Perforations (straight / staggered) | Hard cap on batch size (memory/time limits apply) |
+| Shape infill: DXF / SVG / AI-PDF upload → hole-pattern infill of arbitrary outlines | EPS import (use SVG / PDF instead) |
 | Install slots (L + J shop rules) | |
 | Bend + cut + finished_face + text layers | |
 | Panel ID (ortho + RT parallel flange) | |

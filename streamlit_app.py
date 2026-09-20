@@ -17,7 +17,18 @@ from screenwall_generator import (
 )
 from gcode_export import GCodeConfig, doc_to_gcode, doc_to_gcode_combo
 from gcode_import import parse_gcode, paths_to_document, summarize
-from pdf_preview import paths_to_pdf
+from pdf_preview import doc_to_pdf, paths_to_pdf
+from shape_infill import (
+    MM_PER_IN,
+    PDF_PT_PER_IN,
+    SVG_PX_PER_IN,
+    build_infill_document,
+    infill_hole_centers,
+    load_shape,
+    scale_rings,
+    strip_bounding_rect,
+    ShapeGeometry,
+)
 from sample_data import TEMPLATE_CSV, build_sample_files, zip_files
 
 st.set_page_config(page_title="Screenwall Makr Beta", layout="wide")
@@ -527,3 +538,143 @@ for nc_file in nc_uploads or []:
                 )
     except Exception as e:
         st.error(f"{nc_file.name}: {e}")
+
+# ---------------------------------------------------------------------------
+# Shape infill (DXF / SVG / AI / PDF upload → perforated artwork)
+# ---------------------------------------------------------------------------
+st.markdown('<div class="artform-rule"></div>', unsafe_allow_html=True)
+st.subheader("Infill a shape with perforations")
+st.caption(
+    "Upload **DXF**, **SVG**, or **AI / PDF** files of closed outlines — letters, "
+    "logos, arbitrary polygons — and fill them with the same straight / staggered "
+    "hole pattern the panels use. One file can hold many graphics (a whole word); "
+    "interior voids like the counter of an *O* stay empty. Every hole keeps the "
+    "edge margin from the outline; **edge nudge** lets an almost-fitting hole "
+    "slide slightly inward (same Ø, capped shift) so glyph edges read cleanly. "
+    "Convert text to outlines before export (Illustrator: Type → Create Outlines). "
+    "EPS isn't supported — use SVG, PDF, or PDF-compatible .ai instead."
+)
+shape_uploads = st.file_uploader(
+    "Upload shape files (.dxf / .svg / .ai / .pdf)",
+    type=["dxf", "svg", "ai", "pdf"],
+    accept_multiple_files=True,
+)
+
+if shape_uploads:
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
+        s_hole_dia = st.number_input("Hole Ø (in)", value=0.25, min_value=0.01, step=0.0625, format="%.4f")
+    with c2:
+        s_pitch = st.number_input("Pitch c–c (in)", value=0.75, min_value=0.02, step=0.125, format="%.4f")
+    with c3:
+        s_pattern = st.selectbox("Pattern", ["staggered", "straight"])
+    with c4:
+        s_angle = st.number_input("Stagger angle (°)", value=60.0, min_value=15.0, max_value=90.0, step=5.0)
+    with c5:
+        s_margin = st.number_input("Edge margin (in)", value=0.25, min_value=0.0, step=0.0625, format="%.4f")
+    with c6:
+        s_nudge_pct = st.number_input(
+            "Edge nudge (% of pitch)", value=25, min_value=0, max_value=50, step=5,
+            help="Max distance an almost-fitting boundary hole may slide inward. "
+                 "Same hole size, slightly off-grid. 0 disables.",
+        )
+    s_nudge = s_pitch * s_nudge_pct / 100.0
+
+for shape_file in shape_uploads or []:
+    fkey = shape_file.name
+    with st.expander(f"{shape_file.name}", expanded=True):
+        try:
+            is_svg = fkey.lower().endswith(".svg")
+            is_pdfish = fkey.lower().endswith((".ai", ".pdf"))
+            if is_svg:
+                unit_options = ["px (96 / inch)", "millimeters", "inches", "scale to target width"]
+            elif is_pdfish:
+                unit_options = ["points (72 / inch)", "scale to target width"]
+            else:
+                unit_options = ["inches", "millimeters", "scale to target width"]
+            u1, u2, u3 = st.columns([2.2, 1, 1.2])
+            with u1:
+                unit_label = st.radio(
+                    "Drawing units", unit_options, horizontal=True, key=f"units_{fkey}"
+                )
+            target_width = None
+            with u2:
+                if unit_label.startswith("scale"):
+                    target_width = st.number_input(
+                        "Target width (in)", value=24.0, min_value=0.1, key=f"tw_{fkey}"
+                    )
+            with u3:
+                drop_bg = st.checkbox(
+                    "Drop background rect",
+                    value=is_pdfish,
+                    key=f"bg_{fkey}",
+                    help="Remove one outer rectangle spanning the whole canvas "
+                         "(artboard/background). Uncheck for border/stencil designs.",
+                )
+
+            if unit_label.startswith("px"):
+                unit_scale = 1.0 / SVG_PX_PER_IN
+            elif unit_label.startswith("points"):
+                unit_scale = 1.0 / PDF_PT_PER_IN
+            elif unit_label.startswith("mill"):
+                unit_scale = 1.0 / MM_PER_IN
+            elif unit_label.startswith("scale"):
+                unit_scale = None  # parser default; rescaled to target width below
+            else:
+                unit_scale = 1.0
+
+            shape = load_shape(shape_file.getvalue(), fkey, unit_scale=unit_scale)
+            if drop_bg:
+                shape, removed = strip_bounding_rect(shape)
+                if removed:
+                    st.info("Removed one full-canvas rectangle (artboard/background).")
+            if target_width is not None:
+                w, _ = shape.extents
+                if w > 1e-9:
+                    shape = ShapeGeometry(scale_rings(shape.rings, target_width / w), shape.warnings)
+            for w_msg in shape.warnings:
+                st.warning(w_msg)
+
+            ew, eh = shape.extents
+            result = infill_hole_centers(
+                shape, s_hole_dia, s_pitch, s_pattern, s_angle, s_margin, nudge_max=s_nudge
+            )
+            nudge_note = (
+                f" · **Nudged in to fit:** {result.nudged}" if result.nudged else ""
+            ) + (
+                f" · **Dropped at edge:** {result.dropped}" if result.dropped else ""
+            )
+            st.markdown(
+                f"**Extents:** {ew:.2f}″ × {eh:.2f}″ · **Outlines:** {len(shape.rings)} · "
+                f"**Holes:** {len(result.holes)} × Ø{s_hole_dia}″{nudge_note}"
+            )
+            if not result.holes:
+                st.warning(
+                    "No holes fit. Reduce hole Ø / pitch / margin, scale the shape up, "
+                    "or check the units."
+                )
+            shape_name = Path(fkey).stem
+            doc = build_infill_document(shape, result.holes, s_hole_dia)
+            pdf_bytes = doc_to_pdf(
+                doc, f"{shape_name} - {len(result.holes)} x {s_hole_dia}\" holes"
+            )
+            _show_pdf(pdf_bytes)
+            with tempfile.TemporaryDirectory() as sh_d:
+                dxf_path = Path(sh_d) / f"{shape_name}_perf.dxf"
+                doc.saveas(str(dxf_path))
+                dxf_bytes = dxf_path.read_bytes()
+            d1, d2, _ = st.columns([1.2, 1.2, 3])
+            with d1:
+                st.download_button(
+                    f"⬇ {shape_name}_perf.dxf", dxf_bytes, f"{shape_name}_perf.dxf",
+                    mime="application/octet-stream", key=f"shape_dxf_{fkey}",
+                )
+            with d2:
+                st.download_button(
+                    f"⬇ {shape_name}_perf.pdf", pdf_bytes, f"{shape_name}_perf.pdf",
+                    mime="application/pdf", key=f"shape_pdf_{fkey}",
+                )
+        except ValueError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"{shape_file.name}: {e}")
