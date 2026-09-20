@@ -2,6 +2,7 @@ import base64
 import io
 import tempfile
 import zipfile
+from fractions import Fraction
 from pathlib import Path
 
 import streamlit as st
@@ -19,7 +20,6 @@ from gcode_export import GCodeConfig, doc_to_gcode, doc_to_gcode_combo
 from gcode_import import parse_gcode, paths_to_document, summarize
 from pdf_preview import doc_to_pdf, paths_to_pdf
 from shape_infill import (
-    MIN_PITCH_FACTOR,
     MM_PER_IN,
     PDF_PT_PER_IN,
     SVG_PX_PER_IN,
@@ -27,6 +27,7 @@ from shape_infill import (
     build_infill_document,
     infill_hole_centers,
     load_shape,
+    recommend_hole,
     scale_rings,
     strip_bounding_rect,
     ShapeGeometry,
@@ -566,11 +567,21 @@ shape_uploads = st.file_uploader(
 )
 
 if shape_uploads:
+    s_autodia = st.checkbox(
+        "Size holes from the artwork's stroke width (recommended)", value=True,
+        help="The tool picks the hole Ø per file: stroke width ÷ 7.5, rounded "
+             "down to the nearest 1/16″ (e.g. an 18″ Helvetica Bold letter with "
+             "a ~2.8″ stroke gets Ø 3/8″), at the standard pitch of 2×Ø — about "
+             "five staggered rows across the stroke. Uncheck to use the entered "
+             "Ø and pitch instead.",
+    )
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
-        s_hole_dia = st.number_input("Hole Ø (in)", value=0.25, min_value=0.01, step=0.0625, format="%.4f")
+        s_hole_dia = st.number_input("Hole Ø (in)", value=0.25, min_value=0.01, step=0.0625, format="%.4f",
+                                     disabled=s_autodia)
     with c2:
-        s_pitch = st.number_input("Pitch c–c (in)", value=0.75, min_value=0.02, step=0.125, format="%.4f")
+        s_pitch = st.number_input("Pitch c–c (in)", value=0.75, min_value=0.02, step=0.125, format="%.4f",
+                                  disabled=s_autodia)
     with c3:
         s_pattern = st.selectbox("Pattern", ["staggered", "straight"])
     with c4:
@@ -606,10 +617,10 @@ if shape_uploads:
         s_autofit = st.checkbox(
             "Auto-fit pitch to strokes", value=True,
             help="Makes the adjustment for you: measures the typical stroke width "
-                 "and tightens the working pitch (never below "
-                 f"{MIN_PITCH_FACTOR}× hole Ø, never looser than entered) so the "
-                 "target rows span the typical stroke — full infill that reflects "
-                 "the letter. The pitch actually used is reported.",
+                 "and tightens the working pitch (never below 1.5× hole Ø so "
+                 "holes never read as touching, never looser than entered) so "
+                 "the target rows span the typical stroke. The pitch actually "
+                 "used is reported.",
         )
     with t4:
         s_rows = st.number_input(
@@ -675,14 +686,25 @@ for shape_file in shape_uploads or []:
 
             ew, eh = shape.extents
 
-            stroke = analyze_strokes(shape, s_hole_dia, s_pitch, s_margin)
+            file_dia, file_pitch = s_hole_dia, s_pitch
+            if s_autodia:
+                rec = recommend_hole(shape, s_margin)
+                if rec is not None:
+                    file_dia, file_pitch, rec_stroke = rec
+                    st.info(
+                        f"Sized from artwork: {rec_stroke}″ stroke → hole "
+                        f"**Ø {Fraction(file_dia).limit_denominator(16)}″** "
+                        f"({file_dia:.4f}″) at pitch **{file_pitch:.4f}″** (2×Ø)."
+                    )
+
+            stroke = analyze_strokes(shape, file_dia, file_pitch, s_margin)
             if stroke is not None:
                 msg = (
                     f"**Stroke analysis:** typical {stroke.median_width}″ wide "
                     f"(thin {stroke.thin_width}″)."
                 )
                 if not s_autofit and stroke.rows_typical < 3:
-                    if stroke.fit_pitch is not None and stroke.fit_pitch < s_pitch:
+                    if stroke.fit_pitch is not None and stroke.fit_pitch < file_pitch:
                         msg += (
                             f" Only ~{stroke.rows_typical} rows at this pitch — set "
                             f"pitch ≤ **{stroke.fit_pitch}″** or enable Auto-fit."
@@ -701,15 +723,15 @@ for shape_file in shape_uploads or []:
                     st.warning(warn + ".")
 
             result = infill_hole_centers(
-                shape, s_hole_dia, s_pitch, s_pattern, s_angle, s_margin,
-                nudge_max=s_pitch * s_flex_pct / 100.0,
+                shape, file_dia, file_pitch, s_pattern, s_angle, s_margin,
+                nudge_max=file_pitch * s_flex_pct / 100.0,
                 perimeter_row=s_perimeter, optimize_grid=True,
                 narrow_fill=s_narrow, spacing_flex=s_flex_pct / 100.0,
                 auto_pitch=s_autofit, target_rows=int(s_rows),
             )
             if result.pitch_used is not None:
                 st.info(
-                    f"Auto-fit: pitch tightened {s_pitch}″ → **{result.pitch_used}″** "
+                    f"Auto-fit: pitch tightened {file_pitch}″ → **{result.pitch_used}″** "
                     f"so {int(s_rows)} rows span the typical stroke."
                 )
             nudge_note = (
@@ -723,7 +745,7 @@ for shape_file in shape_uploads or []:
             )
             st.markdown(
                 f"**Extents:** {ew:.2f}″ × {eh:.2f}″ · **Outlines:** {len(shape.rings)} · "
-                f"**Holes:** {len(result.holes)} × Ø{s_hole_dia}″{nudge_note}"
+                f"**Holes:** {len(result.holes)} × Ø{file_dia}″{nudge_note}"
             )
             if not result.holes:
                 st.warning(
@@ -731,9 +753,9 @@ for shape_file in shape_uploads or []:
                     "or check the units."
                 )
             shape_name = Path(fkey).stem
-            doc = build_infill_document(shape, result.holes, s_hole_dia)
+            doc = build_infill_document(shape, result.holes, file_dia)
             pdf_bytes = doc_to_pdf(
-                doc, f"{shape_name} - {len(result.holes)} x {s_hole_dia}\" holes"
+                doc, f"{shape_name} - {len(result.holes)} x {file_dia}\" holes"
             )
             _show_pdf(pdf_bytes)
             with tempfile.TemporaryDirectory() as sh_d:

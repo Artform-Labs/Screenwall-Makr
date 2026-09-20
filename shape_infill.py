@@ -867,6 +867,13 @@ def _grid_candidates(shape: ShapeGeometry, hole_dia, pitch, pattern, stagger_ang
 
 # Tightest manufacturable pitch, as a multiple of hole diameter (web ≈ 0.2×Ø).
 MIN_PITCH_FACTOR = 1.2
+# Auto-fit never tightens the pitch below this multiple of Ø: holes closer
+# than that read as touching. Below it, the HOLE is what must change.
+AUTO_PITCH_FLOOR = 1.5
+# Sign-industry sizing: hole Ø ≈ stroke width / 7.5 at pitch 2×Ø gives ~5 rows
+# across the stroke (e.g. 18" Helvetica Bold, ~2.8" stroke -> Ø 3/8").
+STROKE_TO_DIA = 7.5
+DIA_INCREMENT = 1.0 / 16.0
 # Relaxation iterations for the elastic lattice.
 ELASTIC_ITERATIONS = 8
 
@@ -948,7 +955,7 @@ def elastic_lattice_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: flo
     orig = pts.copy()
     n0 = len(pts)
     cap = flex * p_s
-    r_min = max(1.05 * hole_dia, (1.0 - flex) * p_s * 0.95)
+    r_min = max(1.2 * hole_dia, (1.0 - flex) * p_s * 0.95)
     active = np.ones(n0, dtype=bool)
     if avoid is not None and len(avoid) and avoid_dist > 0:
         av = np.asarray(avoid, dtype=float)
@@ -996,7 +1003,7 @@ def elastic_lattice_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: flo
     # Final admission: least-moved first, enforcing separation (and ring gap).
     kept: list[tuple[float, float]] = []
     moved = 0
-    admit_r = max(1.05 * hole_dia, r_min * 0.95)
+    admit_r = max(1.2 * hole_dia, r_min * 0.95)
     for i in np.argsort(disp):
         if not valid[i]:
             continue
@@ -1088,6 +1095,31 @@ def analyze_strokes(shape: ShapeGeometry, hole_dia: float, pitch: float,
             fit_dia = round(dia, 3)
     return StrokeAnalysis(round(med, 3), round(thin, 3), rows(med), rows(thin),
                           fit_pitch, fit_scale, fit_dia)
+
+
+def recommend_hole(shape: ShapeGeometry, margin: float):
+    """Hole Ø + pitch sized FROM the artwork's stroke widths.
+
+    The look that reads right on channel letters: Ø ≈ stroke / STROKE_TO_DIA
+    (rounded down to the nearest 1/16", min 1/8") at the aesthetic pitch of
+    2 × Ø — about five staggered rows across the typical stroke. The stroke is
+    taken at the 25th percentile of boundary chord widths so thin strokes are
+    served and caps/junctions cannot inflate it.
+
+    Returns (dia, pitch, stroke_width) or None if the shape yields no chords.
+    """
+    segs = _segment_arrays(shape.rings)
+    step = max(0.05, sum(shape.extents) / 400.0)
+    widths = np.asarray([c[4] for c in _boundary_chords(shape, segs, step)])
+    if len(widths) == 0:
+        return None
+    stroke = float(np.percentile(widths, 25))
+    dia = max(math.floor(stroke / STROKE_TO_DIA / DIA_INCREMENT) * DIA_INCREMENT,
+              2.0 * DIA_INCREMENT)
+    # the hole must still physically fit the stroke with margin on both sides
+    while dia > 2.0 * DIA_INCREMENT and stroke < dia + 2.0 * margin + 0.02:
+        dia -= DIA_INCREMENT
+    return dia, 2.0 * dia, round(stroke, 3)
 
 
 def _midline_rescue(shape: ShapeGeometry, segs, ring_holes, other_holes,
@@ -1348,7 +1380,7 @@ def stroke_band_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: float,
     band: list[tuple[float, float]] = []
     center: list[tuple[float, float]] = []
     dropped = 0
-    r_admit = max(1.05 * hole_dia, 0.7 * pitch)
+    r_admit = max(1.2 * hole_dia, 0.7 * pitch)
     avoid_pts = list(avoid) if avoid else []
 
     def _admit(x, y, req, sink, probe=False):
@@ -1371,9 +1403,9 @@ def stroke_band_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: float,
     # half a spacing out of phase, so their true center distance is the
     # diagonal hypot(gap, pitch/2) — the gap alone may be tighter than Ø+5%.
     if pattern == "staggered":
-        g_floor = math.sqrt(max((1.05 * hole_dia) ** 2 - (pitch / 2.0) ** 2, 0.0))
+        g_floor = math.sqrt(max((1.25 * hole_dia) ** 2 - (pitch / 2.0) ** 2, 0.0))
     else:
-        g_floor = 1.05 * hole_dia
+        g_floor = 1.25 * hole_dia
     for ch, closed in chains:
         sm = _smooth_chain(ch, closed)
         w_rel = sm[:, 2][sm[:, 2] <= limit]
@@ -1483,7 +1515,7 @@ def _corner_anchor_pass(shape: ShapeGeometry, segs, existing, hole_dia: float,
                         pitch: float, margin: float, flex: float):
     """Add a hole at any sharp corner (letter apex) the fill left bare."""
     clearance = margin + hole_dia / 2.0
-    min_gap = max(1.05 * hole_dia, 0.6 * pitch)
+    min_gap = max(1.2 * hole_dia, 0.6 * pitch)
     added = []
     for ring in shape.rings:
         for ci in _ring_corners(ring):
@@ -1539,9 +1571,11 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
 
     ``auto_pitch`` (letter-aware mode only) makes the adjustment itself
     instead of only reporting it: the working pitch is tightened — never
-    loosened, floored at ``MIN_PITCH_FACTOR × Ø`` — so ``target_rows`` rows
-    span the typical measured stroke. The pitch actually used is returned in
-    ``InfillResult.pitch_used`` (None when unchanged).
+    loosened, floored at ``AUTO_PITCH_FLOOR × Ø`` so holes never read as
+    touching — so ``target_rows`` rows span the typical measured stroke. The
+    pitch actually used is returned in ``InfillResult.pitch_used`` (None when
+    unchanged). When even the floored pitch can't reach the target, the hole
+    is what must change: see `recommend_hole` for stroke-derived Ø sizing.
     """
     if hole_dia <= 0 or pitch <= 0:
         raise ValueError("hole diameter and pitch must be positive")
@@ -1566,7 +1600,7 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
             avail = float(np.percentile(strokes, 25)) - 2.0 * clearance
             if avail > 0:
                 p_fit = max(avail / (max(target_rows - 1, 1) * row_f),
-                            MIN_PITCH_FACTOR * hole_dia)
+                            AUTO_PITCH_FLOOR * hole_dia)
                 if p_fit < pitch:
                     pitch = p_fit
                     pitch_used = round(p_fit, 4)

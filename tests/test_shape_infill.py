@@ -6,6 +6,7 @@ import pytest
 
 from pdf_preview import doc_to_pdf
 from shape_infill import (
+    recommend_hole,
     InfillResult,
     MIN_PITCH_FACTOR,
     ShapeGeometry,
@@ -616,9 +617,9 @@ def test_auto_pitch_full_infill():
     res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
                               narrow_fill=True, spacing_flex=0.15,
                               auto_pitch=True, target_rows=3)
-    # 1.0" stroke, clearance 0.21875: (1.0 - 0.4375) / (2 sin 60) = 0.3248
-    assert res.pitch_used == pytest.approx(0.3248, abs=1e-3)
-    assert res.pitch_used >= MIN_PITCH_FACTOR * 0.25
+    # 1.0" stroke wants (1.0 - 0.4375) / (2 sin 60) = 0.3248, but the floor of
+    # 1.5 x dia wins: holes must never read as touching.
+    assert res.pitch_used == pytest.approx(1.5 * 0.25, abs=1e-3)
     # stems now carry three straight columns each
     left = _column_xs(res.holes, 0.0, 1.0, 0.3, 2.4)
     right = _column_xs(res.holes, 2.6, 3.6, 2.6, 4.7)
@@ -628,12 +629,43 @@ def test_auto_pitch_full_infill():
     # substantially denser than without auto-fit
     base = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
                                narrow_fill=True, spacing_flex=0.15)
-    assert len(res.holes) > 1.5 * len(base.holes)
+    assert len(res.holes) > 1.25 * len(base.holes)
     # never loosens: a fine pitch stays as entered
-    fine = infill_hole_centers(shape, 0.25, 0.31, "staggered", 60.0, 0.09375,
+    fine = infill_hole_centers(shape, 0.25, 0.36, "staggered", 60.0, 0.09375,
                                narrow_fill=True, spacing_flex=0.15,
                                auto_pitch=True, target_rows=3)
     assert fine.pitch_used is None
+    # no two holes ever read as touching: min separation >= 1.15 x dia
+    pts = res.holes
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+            assert d >= 1.15 * 0.25 - 1e-6
+
+
+def test_recommend_hole_from_stroke_width():
+    """Hole Ø derives from stroke width: an 18-inch Helvetica-Bold-class
+    letter (~2.84-inch stroke) gets Ø 3/8-inch at pitch 2 x Ø."""
+    shape = ShapeGeometry([_rect(0, 0, 2.843, 18.0)])
+    dia, pitch, stroke = recommend_hole(shape, 0.25)
+    assert stroke == pytest.approx(2.843, abs=0.05)
+    assert dia == pytest.approx(0.375)
+    assert pitch == pytest.approx(0.75)
+    # small artwork floors at 1/8" but must still physically fit the stroke
+    small = ShapeGeometry([_rect(0, 0, 0.6, 5.0)])
+    dia_s, pitch_s, _ = recommend_hole(small, 0.09375)
+    assert dia_s == pytest.approx(0.125)
+    assert pitch_s == pytest.approx(0.25)
+    # and the sized result fills without touching holes
+    res = infill_hole_centers(shape, dia, pitch, "staggered", 60.0, 0.25,
+                              narrow_fill=True, spacing_flex=0.15,
+                              auto_pitch=True, target_rows=3)
+    assert len(res.holes) > 60
+    pts = res.holes
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+            assert d >= 1.15 * dia - 1e-6
 
 
 def test_stroke_fill_thin_stroke_single_centerline():
