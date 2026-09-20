@@ -99,6 +99,7 @@ class StrokeAnalysis:
     fit_pitch: float | None      # pitch that reaches 3 rows across the typical
                                  # stroke, or None if the hole is too big for that
     fit_scale: float | None      # or: scale-up factor for the current pitch
+    fit_dia: float | None = None  # or: hole Ø that reaches 3 rows at pitch = 2×Ø
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +866,148 @@ def _grid_candidates(shape: ShapeGeometry, hole_dia, pitch, pattern, stagger_ang
 
 # Tightest manufacturable pitch, as a multiple of hole diameter (web ≈ 0.2×Ø).
 MIN_PITCH_FACTOR = 1.2
+# Relaxation iterations for the elastic lattice.
+ELASTIC_ITERATIONS = 8
+
+
+def _neighbor_pairs(pts, active, r):
+    """Index pairs of active points closer than r (uniform-grid hash)."""
+    cell = max(r, 1e-9)
+    buckets: dict[tuple[int, int], list[int]] = {}
+    idxs = np.nonzero(active)[0]
+    for i in idxs:
+        buckets.setdefault((int(pts[i, 0] // cell), int(pts[i, 1] // cell)), []).append(i)
+    r2 = r * r
+    pairs = []
+    for (cx, cy), members in buckets.items():
+        cand = []
+        for ox in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                cand.extend(buckets.get((cx + ox, cy + oy), []))
+        for i in members:
+            for j in cand:
+                if j <= i:
+                    continue
+                dx = pts[i, 0] - pts[j, 0]
+                dy = pts[i, 1] - pts[j, 1]
+                if dx * dx + dy * dy < r2:
+                    pairs.append((i, j))
+    return pairs
+
+
+def elastic_lattice_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: float,
+                         pattern: str, stagger_angle: float, margin: float,
+                         flex: float, avoid=None, avoid_dist: float = 0.0):
+    """Fill with ONE lattice that keeps its geometry but breathes within ±flex.
+
+    The answer to "even fill that still reads as a 60° pattern":
+
+    1. **Global fit** — sweep the lattice's uniform scale (±flex, exact
+       stagger angle preserved) and phase; keep the configuration where the
+       most holes are inside or within reach of the boundary.
+    2. **Local relaxation** — iterate: holes violating edge clearance slide
+       along the boundary normal until they clear; crowded holes push apart.
+       Every hole is tethered to its original lattice node by ``flex×pitch``,
+       so the field can never drift into visible distortion.
+    3. Holes that cannot reach validity inside their tether drop out.
+
+    Edge holes end up hugging the outline at exact clearance (tight
+    perimeter) while interior holes stay on-lattice — one continuous system,
+    no ring/grid seams. Returns (holes, moved_count, dropped_count).
+    """
+    clearance = margin + hole_dia / 2.0
+    straight = pattern == "straight"
+    alpha = math.radians(stagger_angle)
+
+    scales = sorted({1.0, 1.0 - flex, 1.0 - flex / 2.0, 1.0 + flex / 2.0, 1.0 + flex})
+    best = None
+    for s in scales:
+        p_s = pitch * s
+        if p_s < MIN_PITCH_FACTOR * hole_dia:
+            continue
+        row_step = p_s if straight else p_s * math.sin(alpha)
+        for i in range(3):
+            for j in range(3):
+                cand = _grid_candidates(shape, hole_dia, p_s, pattern, stagger_angle,
+                                        margin, phase=(p_s * i / 3.0, row_step * j / 3.0))
+                if not cand:
+                    continue
+                pts = np.asarray(cand, dtype=float)
+                inside, d, _, _ = _classify_centers(pts, segs)
+                viable = inside & (d >= clearance - flex * p_s)
+                strict = inside & (d >= clearance)
+                score = (int(viable.sum()), int(strict.sum()), -abs(s - 1.0))
+                if best is None or score > best[0]:
+                    best = (score, pts[viable], p_s)
+    if best is None or len(best[1]) == 0:
+        return [], 0, 0
+
+    pts = best[1].copy()
+    p_s = best[2]
+    orig = pts.copy()
+    n0 = len(pts)
+    cap = flex * p_s
+    r_min = max(1.05 * hole_dia, (1.0 - flex) * p_s * 0.95)
+    active = np.ones(n0, dtype=bool)
+    if avoid is not None and len(avoid) and avoid_dist > 0:
+        av = np.asarray(avoid, dtype=float)
+
+        def _too_close(p):
+            return np.min((av[:, 0] - p[0]) ** 2 + (av[:, 1] - p[1]) ** 2) < avoid_dist ** 2
+    else:
+        av = None
+
+    for _ in range(ELASTIC_ITERATIONS):
+        inside, d, qx, qy = _classify_centers(pts, segs)
+        signed = np.where(inside, d, -d)
+        need = clearance - signed
+        viol = active & (need > 1e-9)
+        if np.any(viol):
+            vx = pts[viol, 0] - qx[viol]
+            vy = pts[viol, 1] - qy[viol]
+            norm = np.maximum(np.hypot(vx, vy), 1e-12)
+            sign = np.where(inside[viol], 1.0, -1.0)
+            step = need[viol] + 1e-4
+            pts[viol, 0] += sign * vx / norm * step
+            pts[viol, 1] += sign * vy / norm * step
+        # crowding: push apart pairs closer than r_min
+        for i, j in _neighbor_pairs(pts, active, r_min):
+            dx = pts[i, 0] - pts[j, 0]
+            dy = pts[i, 1] - pts[j, 1]
+            dist = math.hypot(dx, dy)
+            if dist < 1e-12:
+                continue
+            push = (r_min - dist) / 2.0
+            pts[i, 0] += dx / dist * push
+            pts[i, 1] += dy / dist * push
+            pts[j, 0] -= dx / dist * push
+            pts[j, 1] -= dy / dist * push
+        # tether: nothing strays farther than the flex budget from its node
+        disp = pts - orig
+        dn = np.hypot(disp[:, 0], disp[:, 1])
+        over = active & (dn > cap)
+        if np.any(over):
+            pts[over] = orig[over] + disp[over] * (cap / dn[over])[:, None]
+
+    inside, d, _, _ = _classify_centers(pts, segs)
+    valid = active & inside & (d >= clearance - 1e-6)
+    disp = np.hypot(pts[:, 0] - orig[:, 0], pts[:, 1] - orig[:, 1])
+    # Final admission: least-moved first, enforcing separation (and ring gap).
+    kept: list[tuple[float, float]] = []
+    moved = 0
+    admit_r = max(1.05 * hole_dia, r_min * 0.95)
+    for i in np.argsort(disp):
+        if not valid[i]:
+            continue
+        x, y = float(pts[i, 0]), float(pts[i, 1])
+        if any((x - kx) ** 2 + (y - ky) ** 2 < admit_r * admit_r for kx, ky in kept):
+            continue
+        if av is not None and _too_close((x, y)):
+            continue
+        kept.append((x, y))
+        if disp[i] > 1e-6:
+            moved += 1
+    return kept, moved, n0 - len(kept)
 # Grid rows must sit at least this fraction of pitch from the perimeter ring
 # (shared by the exclusion zone and the rows-across estimate).
 RING_EXCLUSION_FACTOR = 0.8
@@ -928,16 +1071,22 @@ def analyze_strokes(shape: ShapeGeometry, hole_dia: float, pitch: float,
 
     fit_pitch = (med - 2.0 * clearance) / (2.0 * RING_EXCLUSION_FACTOR)
     floor_pitch = MIN_PITCH_FACTOR * hole_dia
+    fit_dia = None
     if fit_pitch >= floor_pitch:
         fit_pitch = round(min(fit_pitch, pitch), 4)
         fit_scale = None
     else:
-        # Even the tightest pitch can't reach 3 rows: the artwork must grow.
+        # Even the tightest pitch can't reach 3 rows: the artwork must grow —
+        # or the hole must shrink. 3 rows at the aesthetic pitch of 2×Ø needs
+        # w ≥ 2·margin + Ø + 2·0.8·(2Ø)  →  Ø ≤ (w − 2·margin) / 4.2.
         need_w = 2.0 * clearance + 2.0 * RING_EXCLUSION_FACTOR * floor_pitch
         fit_pitch = None
         fit_scale = round(need_w / max(med, 1e-9), 2)
+        dia = (med - 2.0 * margin) / 4.2
+        if dia > 0.02:
+            fit_dia = round(dia, 3)
     return StrokeAnalysis(round(med, 3), round(thin, 3), rows(med), rows(thin),
-                          fit_pitch, fit_scale)
+                          fit_pitch, fit_scale, fit_dia)
 
 
 def _midline_rescue(shape: ShapeGeometry, segs, ring_holes, other_holes,
@@ -988,10 +1137,35 @@ def _midline_rescue(shape: ShapeGeometry, segs, ring_holes, other_holes,
     return added, dropped
 
 
+def _corner_anchor_pass(shape: ShapeGeometry, segs, existing, hole_dia: float,
+                        pitch: float, margin: float, flex: float):
+    """Add a hole at any sharp corner (letter apex) the fill left bare."""
+    clearance = margin + hole_dia / 2.0
+    min_gap = max(1.05 * hole_dia, 0.6 * pitch)
+    added = []
+    for ring in shape.rings:
+        for ci in _ring_corners(ring):
+            cand, _ = _corner_candidate(ring, ci, segs, clearance)
+            if cand is None:
+                continue
+            x, y = cand
+            if not _fits_one(x, y, segs, clearance):
+                moved = _try_nudge(x, y, segs, clearance, max(flex, 0.2) * pitch)
+                if moved is None:
+                    continue
+                x, y = moved
+            if any((x - hx) ** 2 + (y - hy) ** 2 < min_gap * min_gap
+                   for hx, hy in existing + added):
+                continue
+            added.append((x, y))
+    return added
+
+
 def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
                         pattern: str, stagger_angle: float, margin: float,
                         nudge_max: float = 0.0, perimeter_row: bool = False,
-                        optimize_grid: bool = False, narrow_fill: bool = False) -> InfillResult:
+                        optimize_grid: bool = False, narrow_fill: bool = False,
+                        spacing_flex: float = 0.0) -> InfillResult:
     """Hole grid over the shape bbox, filtered to holes that fully fit inside.
 
     Same grid math and margin semantics as the panel face (`_hole_centers`):
@@ -1012,7 +1186,13 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
 
     ``narrow_fill`` chains a centerline row through strokes too narrow for
     grid rows between the perimeter rings (see `_midline_rescue`); use
-    `analyze_strokes` to see measured widths and pitch/scale guidance.
+    `analyze_strokes` to see measured widths and pitch/scale/Ø guidance.
+
+    ``spacing_flex`` > 0 switches the fill to the elastic lattice
+    (`elastic_lattice_fill`): one lattice that keeps the stagger angle but may
+    scale/slide/deform locally within ±flex, giving even fill with edge holes
+    hugging the outline. Replaces the grid + nudge stack (``nudge_max`` and
+    ``optimize_grid`` are ignored); the fraction is of pitch (e.g. 0.15).
     """
     if hole_dia <= 0 or pitch <= 0:
         raise ValueError("hole diameter and pitch must be positive")
@@ -1041,6 +1221,31 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
     ring_pts = np.asarray(contour, dtype=float) if contour else None
     # Grid holes must keep visual separation from the perimeter ring.
     ring_excl = 0.8 * pitch
+
+    if spacing_flex > 0.0:
+        # Elastic lattice mode: one lattice, globally scaled/aligned (±flex,
+        # angle preserved) and locally relaxed, replaces the grid/nudge stack.
+        fill, moved, e_dropped = elastic_lattice_fill(
+            shape, segs, hole_dia, pitch, pattern, stagger_angle, margin,
+            spacing_flex, avoid=contour if contour else None,
+            avoid_dist=ring_excl if contour else 0.0,
+        )
+        dropped += e_dropped
+        holes = list(contour) + fill
+        holes += _corner_anchor_pass(shape, segs, holes, hole_dia, pitch, margin, spacing_flex)
+        midline = []
+        if narrow_fill:
+            midline, m_dropped = _midline_rescue(
+                shape, segs, contour, holes[len(contour):], hole_dia, pitch, margin
+            )
+            dropped += m_dropped
+            holes.extend(midline)
+        if len(holes) > MAX_HOLES:
+            raise ValueError(
+                f"Pattern produced {len(holes):,} holes (limit {MAX_HOLES:,}). "
+                "Increase the pitch or shrink the shape."
+            )
+        return InfillResult(holes, moved, dropped, contour=len(contour), midline=len(midline))
 
     def _grid_eval(raw):
         """(fits mask, inside, min_d, pts) for a candidate grid, ring-aware."""

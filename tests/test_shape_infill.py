@@ -456,6 +456,87 @@ def test_midline_rescue_skips_wide_shapes():
     assert len(res.holes) == len(wide_only.holes)
 
 
+# ---------------------------------------------------------------------------
+# Elastic lattice (spacing flex)
+# ---------------------------------------------------------------------------
+def _all_valid(shape, holes, hole_dia, margin, slack=0.0):
+    clearance = margin + hole_dia / 2.0 - slack
+    segs = _segment_arrays(shape.rings)
+    pts = np.asarray(holes, dtype=float)
+    inside, d, _, _ = _classify_centers(pts, segs)
+    return bool(inside.all() and (d >= clearance - 1e-6).all())
+
+
+def test_elastic_wide_rect_stays_rigid():
+    """On a friendly shape the elastic lattice degenerates to the pure grid."""
+    shape = ShapeGeometry([_rect(0, 0, 8, 5)])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              spacing_flex=0.15)
+    assert res.nudged == 0 and res.dropped == 0
+    assert _all_valid(shape, res.holes, 0.25, 0.09375)
+    rigid = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                                optimize_grid=True)
+    assert len(res.holes) >= len(rigid.holes)
+
+
+def test_elastic_annulus_even_coverage():
+    """An o-band gets even fill all the way around — no gaps, no racetrack."""
+    cx, cy, ro, ri = 0.0, 0.0, 1.6, 0.65
+    ring_o = [(cx + ro * math.cos(2 * math.pi * i / 96),
+               cy + ro * math.sin(2 * math.pi * i / 96)) for i in range(96)]
+    ring_i = [(cx + ri * math.cos(2 * math.pi * i / 96),
+               cy + ri * math.sin(2 * math.pi * i / 96)) for i in range(96)]
+    shape = ShapeGeometry([ring_o, ring_i])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              narrow_fill=True, spacing_flex=0.15)
+    body = res.holes[:len(res.holes) - res.midline]
+    assert _all_valid(shape, body, 0.25, 0.09375)
+    assert len(res.holes) >= 20
+    # even angular coverage: no bare arc wider than ~2 pitches on the band
+    angles = sorted(math.atan2(y - cy, x - cx) for x, y in res.holes)
+    gaps = [angles[i + 1] - angles[i] for i in range(len(angles) - 1)]
+    gaps.append(2 * math.pi - (angles[-1] - angles[0]))
+    mid_r = (ro + ri) / 2.0
+    assert max(gaps) * mid_r < 2.0 * 0.5
+    # more than one radial row in most sectors (not a single centerline ring)
+    radii = [math.hypot(x - cx, y - cy) for x, y in res.holes]
+    assert max(radii) - min(radii) > 0.3
+
+
+def test_elastic_stem_continuous_coverage():
+    """A letter-width stem is covered end to end — no bare patches."""
+    shape = ShapeGeometry([_rect(0, 0, 1.0, 5.0)])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              narrow_fill=True, spacing_flex=0.15)
+    assert _all_valid(shape, res.holes, 0.25, 0.09375, slack=0.09375 / 2)
+    ys = sorted(y for _, y in res.holes)
+    span_lo, span_hi = 0.25, 4.75
+    assert ys[0] < span_lo + 0.5 and ys[-1] > span_hi - 0.5
+    assert max(ys[i + 1] - ys[i] for i in range(len(ys) - 1)) < 0.75
+
+
+def test_elastic_moves_are_bounded_and_separated():
+    """Flexed holes stay a manufacturable distance apart."""
+    shape = ShapeGeometry([_rect(0, 0, 1.9, 4.0)])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              spacing_flex=0.2)
+    pts = res.holes
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+            assert d >= 1.05 * 0.25 - 1e-6
+
+
+def test_analyze_strokes_suggests_smaller_hole():
+    """When even the tightest pitch can't reach 3 rows, a smaller Ø is offered."""
+    shape = ShapeGeometry([_rect(0, 0, 1.0, 6.0)])
+    a = analyze_strokes(shape, 0.5, 1.0, 0.09375)
+    assert a.fit_pitch is None and a.fit_scale is not None
+    assert a.fit_dia is not None
+    assert a.fit_dia < 0.5
+    assert a.fit_dia == pytest.approx((1.0 - 2 * 0.09375) / 4.2, abs=1e-3)
+
+
 def test_scale_rings():
     shape = ShapeGeometry(scale_rings([_rect(0, 0, 10, 6)], 2.4))
     assert shape.extents == pytest.approx((24.0, 14.4))

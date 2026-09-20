@@ -578,42 +578,38 @@ if shape_uploads:
     with c5:
         s_margin = st.number_input("Edge margin (in)", value=0.25, min_value=0.0, step=0.0625, format="%.4f")
     with c6:
-        s_nudge_pct = st.number_input(
-            "Edge nudge (% of pitch)", value=25, min_value=0, max_value=50, step=5,
-            help="Max distance an almost-fitting boundary hole may slide inward. "
-                 "Same hole size, slightly off-grid. 0 disables.",
+        s_flex_pct = st.number_input(
+            "Spacing flex (% of pitch)", value=15, min_value=0, max_value=25, step=5,
+            help="How much the hole lattice may locally stretch, compress, or "
+                 "slide to hug the outlines — the stagger angle and hole size "
+                 "never change, so the pattern still reads as drawn. 0 = rigid "
+                 "grid (holes that don't fit are simply dropped).",
         )
-    s_nudge = s_pitch * s_nudge_pct / 100.0
-    t1, t2, t3, t4 = st.columns([1.3, 1.1, 1.4, 1.5])
+    t1, t2, t3, t4 = st.columns([1.3, 1.4, 1.5, 1.2])
     with t1:
         s_perimeter = st.checkbox(
-            "Perimeter outline row", value=True,
-            help="Trace every outline with a dedicated row of holes at exact edge "
-                 "margin: sharp corners always get a hole, and spacing is justified "
-                 "per edge (evenly stretched a few % per side) so the form reads "
-                 "crisply. Interior grid holes that would crowd the row are removed.",
+            "Perimeter outline row", value=False,
+            help="Adds a dedicated row of holes tracing every outline, corner-"
+                 "anchored, justified per edge. Best for LARGE graphics with wide "
+                 "strokes (4+ rows); on letter-width strokes it can read as a "
+                 "racetrack — the elastic lattice already hugs the edges there.",
         )
     with t2:
-        s_optimize = st.checkbox(
-            "Auto-align grid", value=True,
-            help="Slides the interior grid alignment (never the spacing) to the "
-                 "position that fits the most holes inside the shape.",
-        )
-    with t3:
         s_narrow = st.checkbox(
             "Fill narrow strokes", value=True,
-            help="Where a stroke is too narrow for grid rows between the perimeter "
-                 "rows, chain holes down the stroke's centerline instead. In the "
-                 "very narrowest zones the edge margin may relax to half so the "
-                 "form stays covered.",
+            help="Strokes too narrow for lattice rows get a chain of holes down "
+                 "the stroke's centerline. In the very narrowest zones the edge "
+                 "margin may relax to half so the form stays covered.",
         )
-    with t4:
+    with t3:
         s_autofit = st.checkbox(
             "Auto-fit pitch to strokes", value=False,
             help="Measures the typical stroke width and tightens the pitch (never "
                  f"below {MIN_PITCH_FACTOR}× hole Ø, never looser than entered) so "
                  "at least 3 hole rows span the typical stroke.",
         )
+    with t4:
+        st.empty()
 
 for shape_file in shape_uploads or []:
     fkey = shape_file.name
@@ -696,25 +692,27 @@ for shape_file in shape_uploads or []:
                     elif stroke.fit_scale is not None:
                         msg += (
                             f" Even at the tightest pitch this hole Ø can't reach 3 rows — "
-                            f"scale the artwork up ~**{stroke.fit_scale}×** "
-                            "(or use a smaller hole)."
+                            f"scale the artwork up ~**{stroke.fit_scale}×**"
                         )
+                        if stroke.fit_dia is not None:
+                            msg += f" or drop to hole **Ø ≤ {stroke.fit_dia}″** (at pitch 2×Ø)"
+                        msg += "."
                     st.warning(msg)
                 else:
                     st.caption(msg)
 
             result = infill_hole_centers(
                 shape, s_hole_dia, file_pitch, s_pattern, s_angle, s_margin,
-                nudge_max=file_pitch * s_nudge_pct / 100.0,
-                perimeter_row=s_perimeter, optimize_grid=s_optimize,
-                narrow_fill=s_narrow,
+                nudge_max=file_pitch * s_flex_pct / 100.0,
+                perimeter_row=s_perimeter, optimize_grid=True,
+                narrow_fill=s_narrow, spacing_flex=s_flex_pct / 100.0,
             )
             nudge_note = (
                 f" · **Perimeter row:** {result.contour}" if result.contour else ""
             ) + (
                 f" · **Centerline (narrow strokes):** {result.midline}" if result.midline else ""
             ) + (
-                f" · **Nudged in to fit:** {result.nudged}" if result.nudged else ""
+                f" · **Adjusted within flex:** {result.nudged}" if result.nudged else ""
             ) + (
                 f" · **Dropped at edge:** {result.dropped}" if result.dropped else ""
             )
