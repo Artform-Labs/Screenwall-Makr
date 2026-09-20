@@ -527,6 +527,98 @@ def test_elastic_moves_are_bounded_and_separated():
             assert d >= 1.05 * 0.25 - 1e-6
 
 
+def _letter_n(stem=1.0, height=5.0, width=3.6, dh=2.4):
+    return [(0, 0), (stem, 0), (stem, height - dh), (width - stem, 0), (width, 0),
+            (width, height), (width - stem, height), (width - stem, dh),
+            (stem, height), (0, height)]
+
+
+def _column_xs(holes, x_lo, x_hi, y_lo, y_hi):
+    xs = sorted(x for x, y in holes if x_lo <= x <= x_hi and y_lo <= y <= y_hi)
+    cols = []
+    for x in xs:
+        if cols and x - cols[-1][-1] < 0.15:
+            cols[-1].append(x)
+        else:
+            cols.append([x])
+    return cols
+
+
+def test_stroke_fill_letter_stems_identical():
+    """Equal-width stems get the same fill: two straight columns each."""
+    shape = ShapeGeometry([_letter_n()])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              narrow_fill=True, spacing_flex=0.15)
+    # straightness judged on each stem's pure region (away from its junction)
+    left = _column_xs(res.holes, 0.0, 1.0, 0.3, 2.4)
+    right = _column_xs(res.holes, 2.6, 3.6, 2.6, 4.7)
+    assert len(left) == 2 and len(right) == 2
+    for cols in (left, right):
+        for col in cols:
+            assert max(col) - min(col) < 0.05      # dead straight columns
+            assert len(col) >= 3
+    # same wall offsets on both stems (left wall x=0, right stem left wall x=2.6)
+    for cl, cr in zip(left, right):
+        off_l = sum(cl) / len(cl) - 0.0
+        off_r = sum(cr) / len(cr) - 2.6
+        assert off_l == pytest.approx(off_r, abs=0.05)
+    # and each stem is covered end to end
+    for x_lo, x_hi in ((0.0, 1.0), (2.6, 3.6)):
+        ys = sorted(y for x, y in res.holes if x_lo <= x <= x_hi)
+        assert ys[0] < 0.6 and ys[-1] > 4.4
+        assert max(ys[i + 1] - ys[i] for i in range(len(ys) - 1)) < 0.75
+
+
+def test_stroke_fill_diagonal_stops_at_stems():
+    """Diagonal rows terminate at the stems: the bottom courses of the right
+    stem contain only the stem's own two columns."""
+    shape = ShapeGeometry([_letter_n()])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              narrow_fill=True, spacing_flex=0.15)
+    cols = _column_xs(res.holes, 2.6, 3.6, 0.3, 4.7)
+    col_x = [sum(c) / len(c) for c in cols]
+    for x, y in res.holes:
+        if 2.6 <= x <= 3.6 and y <= 1.5:
+            assert any(abs(x - cx) < 0.08 for cx in col_x), \
+                f"stray hole ({x:.2f},{y:.2f}) inside the stem's bottom courses"
+
+
+def test_stroke_fill_annulus_two_uniform_rings():
+    """An o with a letter-width band fills as two clean concentric rows with
+    uniform spacing — same treatment as a straight stem of that width."""
+    ro, ri = 1.6, 0.65
+    ring_o = [(ro * math.cos(2 * math.pi * i / 96), ro * math.sin(2 * math.pi * i / 96))
+              for i in range(96)]
+    ring_i = [(ri * math.cos(2 * math.pi * i / 96), ri * math.sin(2 * math.pi * i / 96))
+              for i in range(96)]
+    shape = ShapeGeometry([ring_o, ring_i])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              narrow_fill=True, spacing_flex=0.15)
+    radii = sorted(math.hypot(x, y) for x, y in res.holes)
+    split = [r for r in radii if r - radii[0] < 0.2]
+    inner, outer = split, radii[len(split):]
+    assert len(inner) >= 8 and len(outer) >= 12
+    assert max(inner) - min(inner) < 0.03          # each ring is a true circle
+    assert max(outer) - min(outer) < 0.03
+    for group in (inner, outer):                   # uniform angular spacing
+        holes = [(x, y) for x, y in res.holes
+                 if abs(math.hypot(x, y) - group[0]) < 0.2]
+        ang = sorted(math.atan2(y, x) for x, y in holes)
+        gaps = [ang[i + 1] - ang[i] for i in range(len(ang) - 1)]
+        gaps.append(2 * math.pi - (ang[-1] - ang[0]))
+        assert max(gaps) / min(gaps) < 1.35
+
+
+def test_stroke_fill_thin_stroke_single_centerline():
+    """A stroke too narrow for two rows gets one centered chain (flex mode)."""
+    shape = ShapeGeometry([_rect(0, 0, 0.55, 4.0)])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              narrow_fill=True, spacing_flex=0.15)
+    assert res.midline >= 5
+    for x, y in res.holes:
+        assert x == pytest.approx(0.275, abs=0.02)
+
+
 def test_analyze_strokes_suggests_smaller_hole():
     """When even the tightest pitch can't reach 3 rows, a smaller Ø is offered."""
     shape = ShapeGeometry([_rect(0, 0, 1.0, 6.0)])

@@ -580,10 +580,11 @@ if shape_uploads:
     with c6:
         s_flex_pct = st.number_input(
             "Spacing flex (% of pitch)", value=15, min_value=0, max_value=25, step=5,
-            help="How much the hole lattice may locally stretch, compress, or "
-                 "slide to hug the outlines — the stagger angle and hole size "
-                 "never change, so the pattern still reads as drawn. 0 = rigid "
-                 "grid (holes that don't fit are simply dropped).",
+            help="Enables letter-aware fill: strokes are detected and filled "
+                 "with rows that follow them (equal stroke widths get identical "
+                 "fill; row/hole spacing may flex by this much), wider areas get "
+                 "the standard lattice. Hole size never changes. 0 = rigid grid "
+                 "only (holes that don't fit are simply dropped).",
         )
     t1, t2, t3, t4 = st.columns([1.3, 1.4, 1.5, 1.2])
     with t1:

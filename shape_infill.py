@@ -1137,6 +1137,323 @@ def _midline_rescue(shape: ShapeGeometry, segs, ring_holes, other_holes,
     return added, dropped
 
 
+def _stroke_chains(seg, limit, slope_tol, step):
+    """Split one wall segment into true stroke chains.
+
+    A sample is *stable* when its chord width is in the stroke regime and not
+    changing steeply station-to-station (steep change = the chord is raking
+    across a junction into another stroke — not a medial measurement). Stable
+    runs are the strokes; two runs are bridged THROUGH the unstable gap when
+    the same width resumes on the far side (a stroke crossed by another one),
+    so a stem passes its junctions whole, while a diagonal's rake into a stem
+    is trimmed off — its rows stop where the stem's territory begins.
+    """
+    n = len(seg)
+    stable = [seg[i][2] <= limit
+              and (i == 0 or abs(seg[i][2] - seg[i - 1][2]) <= slope_tol)
+              for i in range(n)]
+    runs = []
+    i = 0
+    while i < n:
+        if stable[i]:
+            j = i
+            while j + 1 < n and stable[j + 1]:
+                j += 1
+            runs.append([i, j])
+            i = j + 1
+        else:
+            i += 1
+    if not runs:
+        return []
+
+    def _end_width(run, head):
+        i0, i1 = run
+        idx = range(i0, min(i0 + 4, i1 + 1)) if head else range(max(i1 - 3, i0), i1 + 1)
+        ws = sorted(seg[t][2] for t in idx)
+        return ws[len(ws) // 2]
+
+    merged = [runs[0]]
+    for run in runs[1:]:
+        wa = _end_width(merged[-1], head=False)
+        wb = _end_width(run, head=True)
+        gap = (run[0] - merged[-1][1]) * step
+        if abs(wa - wb) <= 0.25 * max(wa, wb) and gap <= 3.2 * max(wa, wb):
+            merged[-1][1] = run[1]
+        else:
+            merged.append(run)
+    return [seg[i0:i1 + 1] for i0, i1 in merged if i1 - i0 >= 1]
+
+
+def _medial_chains(shape: ShapeGeometry, segs, hole_dia: float, margin: float,
+                   limit: float, step: float):
+    """Ordered medial chains through every stroke-width zone of the shape.
+
+    Walks each ring's boundary at ~step spacing, casting the inward chord at
+    every station; where the local width sits in the stroke regime the chord
+    midpoint is a medial sample. Consecutive samples chain into polylines;
+    a jump in position or width (junction, cap, corner) breaks the chain.
+    Since both walls of a stroke trace the same medial line, near-duplicate
+    chains are removed (longest kept). Returns [(samples, closed)] where
+    samples = [(mx, my, w, ix, iy)] with (ix, iy) the cross-stroke unit axis.
+    """
+    lo = hole_dia + margin * 0.5
+    slope_tol = 0.5 * step
+    raw = []
+    for ring in shape.rings:
+        stations = _loop_stations(ring, step)
+        if not stations:
+            continue
+        samples = []
+        for sx, sy, nx, ny in stations:
+            ix, iy = _inward_dir(sx, sy, nx, ny, segs, 1e-4)
+            w = _chord_width(sx, sy, ix, iy, segs)
+            if w is not None and w >= lo:
+                samples.append((sx + ix * w / 2.0, sy + iy * w / 2.0, w, ix, iy))
+            else:
+                samples.append(None)
+
+        # contiguous wall segments: break on invalid stations and wall turns
+        segments, cur = [], []
+        for smp in samples:
+            if smp is None:
+                if cur:
+                    segments.append(cur)
+                    cur = []
+                continue
+            if cur and cur[-1][3] * smp[3] + cur[-1][4] * smp[4] < 0.64:
+                segments.append(cur)
+                cur = []
+            cur.append(smp)
+        if cur:
+            segments.append(cur)
+        wrap_ok = (samples and samples[0] is not None and samples[-1] is not None
+                   and samples[-1][3] * samples[0][3] + samples[-1][4] * samples[0][4] > 0.64)
+        whole = len(segments) == 1
+        if len(segments) >= 2 and wrap_ok:
+            # segment wraps past the ring's start station: rejoin the halves
+            segments[0] = segments.pop() + segments[0]
+        for seg in segments:
+            for chain in _stroke_chains(seg, limit, slope_tol, step):
+                closed = whole and wrap_ok and len(chain) == len(seg)
+                raw.append((chain, closed))
+
+    def _arc_len(ch):
+        return sum(math.hypot(ch[i + 1][0] - ch[i][0], ch[i + 1][1] - ch[i][1])
+                   for i in range(len(ch) - 1))
+
+    raw.sort(key=lambda cb: -_arc_len(cb[0]))
+    kept_pts: list[np.ndarray] = []
+    out = []
+    for ch, closed in raw:
+        if len(ch) < 2:
+            continue
+        # Dedup on reliable samples only: pass-through (junction) midpoints
+        # are not medial points and must not vote in either direction.
+        rel = np.asarray([(p[0], p[1], p[2]) for p in ch if p[2] <= limit])
+        dup = False
+        if len(rel):
+            tol = 0.45 * rel[:, 2]
+            for prev in kept_pts:
+                d = np.min(np.hypot(rel[:, 0, None] - prev[None, :, 0],
+                                    rel[:, 1, None] - prev[None, :, 1]), axis=1)
+                if float(np.mean(d < tol)) > 0.55:
+                    dup = True
+                    break
+        if dup:
+            continue
+        if len(rel):
+            kept_pts.append(rel[:, :2])
+        out.append((ch, closed))
+    return out
+
+
+def _smooth_chain(ch, closed, win=5):
+    """Moving-average the medial samples (position, width, cross axis)."""
+    arr = np.asarray(ch, dtype=float)
+    n = len(arr)
+    if n < 3:
+        return arr
+    out = arr.copy()
+    half = win // 2
+    for i in range(n):
+        if closed:
+            idx = [(i + k) % n for k in range(-half, half + 1)]
+        else:
+            idx = list(range(max(0, i - half), min(n, i + half + 1)))
+        out[i, :3] = arr[idx, :3].mean(axis=0)
+        vx, vy = arr[idx, 3].mean(), arr[idx, 4].mean()
+        L = math.hypot(vx, vy)
+        if L > 1e-9:
+            out[i, 3], out[i, 4] = vx / L, vy / L
+    return out
+
+
+def _points_along(poly, closed, dists):
+    """Points at the given arc-length distances along a polyline."""
+    n = len(poly)
+    seg = []
+    m = n if closed else n - 1
+    for i in range(m):
+        a, b = poly[i], poly[(i + 1) % n]
+        seg.append(math.hypot(b[0] - a[0], b[1] - a[1]))
+    cum = [0.0]
+    for L in seg:
+        cum.append(cum[-1] + L)
+    total = cum[-1]
+    out = []
+    for t in dists:
+        t = min(max(t, 0.0), total)
+        for i in range(m):
+            if cum[i + 1] >= t - 1e-12:
+                f = (t - cum[i]) / max(seg[i], 1e-12)
+                a, b = poly[i], poly[(i + 1) % n]
+                out.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f))
+                break
+    return out
+
+
+def stroke_band_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: float,
+                     pattern: str, stagger_angle: float, margin: float,
+                     flex: float, narrow_relax: bool = True, avoid=None):
+    """Fill letter-width strokes with rows that FOLLOW the stroke.
+
+    This is how equal strokes get equal fill: the row count comes from the
+    local stroke width (not from where a global grid happens to land), so the
+    two stems of an N and an o of the same stroke width all read identically.
+
+    Per medial chain (see `_medial_chains`):
+    - rows across = the count whose cross-gap is closest to the pattern's
+      nominal row step, evenly justified between the walls (edge rows sit at
+      exact clearance — the tight perimeter comes free);
+    - holes along each row at ~pitch, justified over the row length (closed
+      loops divide evenly), alternate rows phase-shifted half a spacing so
+      the field keeps the staggered look;
+    - a chain breaks where the stroke ends or widens into a junction, and a
+      hole is dropped rather than crowd one already placed by a longer chain
+      — so a diagonal's rows STOP where they meet a stem's rows.
+
+    Returns (band_holes, centerline_holes, dropped): centerline_holes are the
+    single-row chains through zones too narrow for two rows (edge margin may
+    relax to half there when ``narrow_relax``).
+    """
+    clearance = margin + hole_dia / 2.0
+    hr = hole_dia / 2.0
+    g_nom = pitch * (math.sin(math.radians(stagger_angle))
+                     if pattern == "staggered" else 1.0)
+    limit = 2.0 * clearance + 3.4 * g_nom
+    step = max(min(pitch / 3.0, 0.5), sum(shape.extents) / 600.0)
+    chains = _medial_chains(shape, segs, hole_dia, margin, limit, step)
+
+    band: list[tuple[float, float]] = []
+    center: list[tuple[float, float]] = []
+    dropped = 0
+    r_admit = max(1.05 * hole_dia, 0.7 * pitch)
+    avoid_pts = list(avoid) if avoid else []
+
+    def _admit(x, y, req, sink, probe=False):
+        nonlocal dropped
+        if not _fits_one(x, y, segs, req):
+            moved = _try_nudge(x, y, segs, req, 0.3 * pitch)
+            if moved is None:
+                if not probe:
+                    dropped += 1
+                return False
+            x, y = moved
+        for hx, hy in band + center + avoid_pts:
+            if (x - hx) ** 2 + (y - hy) ** 2 < r_admit * r_admit:
+                return False
+        sink.append((x, y))
+        return True
+
+    s_lo, s_hi = max(0.7, 1.0 - flex - 0.1), min(1.35, 1.0 + flex + 0.15)
+    for ch, closed in chains:
+        sm = _smooth_chain(ch, closed)
+        w_rel = sm[:, 2][sm[:, 2] <= limit]
+        w_med = float(np.median(w_rel)) if len(w_rel) else float(np.median(sm[:, 2]))
+        avail = max(w_med - 2.0 * clearance, 0.0)
+        k = 1
+        if avail > 1e-9:
+            k = int(round(avail / g_nom)) + 1
+            while k > 1 and avail / (k - 1) < max(1.05 * hole_dia, 0.72 * g_nom):
+                k -= 1
+            k = max(1, k)
+        if k == 1 and narrow_relax and w_med < 2.0 * clearance + 1.05 * hole_dia:
+            req = max(hr + margin * 0.5, hr + 1e-4)
+        else:
+            req = clearance
+        sink = band if k >= 2 else center
+        for j in range(k):
+            if k == 1:
+                # true medial centerline
+                poly = [(x, y) for x, y, w, ix, iy in sm]
+            else:
+                # Rows are anchored to the wall the chain was traced from, and
+                # the cross width is clamped near the chain median: where the
+                # far wall veers away (a junction), the rows keep running
+                # straight instead of fanning after the drifting midpoint.
+                frac = j / (k - 1)
+                poly = []
+                for x, y, w, ix, iy in sm:
+                    w_eff = min(w, 1.05 * w_med)
+                    span = max(w_eff - 2.0 * clearance, 0.0)
+                    d = clearance + frac * span
+                    poly.append((x - ix * w / 2.0 + ix * d,
+                                 y - iy * w / 2.0 + iy * d))
+            m = len(poly) if closed else len(poly) - 1
+            L = sum(math.hypot(poly[(i + 1) % len(poly)][0] - poly[i][0],
+                               poly[(i + 1) % len(poly)][1] - poly[i][1])
+                    for i in range(m))
+            half = j % 2 == 1
+            if closed:
+                n_h = max(3, round(L / pitch))
+                s = L / n_h
+                dists = [(i + (0.5 if half else 0.0)) * s for i in range(n_h)]
+            else:
+                if L < 0.55 * pitch:
+                    if half:
+                        continue
+                    dists = [L / 2.0]
+                else:
+                    n_h = max(2, round(L / pitch) + 1)
+                    s = L / (n_h - 1)
+                    while s < s_lo * pitch and n_h > 2:
+                        n_h -= 1
+                        s = L / (n_h - 1)
+                    while s > s_hi * pitch:
+                        n_h += 1
+                        s = L / (n_h - 1)
+                    if half:
+                        dists = [(i + 0.5) * s for i in range(n_h - 1)]
+                    else:
+                        dists = [i * s for i in range(n_h)]
+            for x, y in _points_along(poly, closed, dists):
+                _admit(x, y, req, sink)
+            if not closed and len(poly) >= 2 and L >= 0.55 * pitch:
+                # A stroke's rows keep running straight past the chain end —
+                # into the junction — until they no longer fit or reach a hole
+                # another stroke already owns; then they stop.
+                s_ext = dists[1] - dists[0] if len(dists) >= 2 else pitch
+                probe = min(0.3 * pitch, L / 2.0)
+                ends = _points_along(poly, False, [0.0, probe, L - probe, L])
+                for b, a, placed in ((ends[0], ends[1], dists[0]),
+                                     (ends[3], ends[2], L - dists[-1])):
+                    ux, uy = b[0] - a[0], b[1] - a[1]
+                    norm = math.hypot(ux, uy)
+                    if norm < 1e-9:
+                        continue
+                    ux, uy = ux / norm, uy / norm
+                    # keep the row phase: one spacing beyond the last placed hole
+                    dist_out = s_ext - placed
+                    if dist_out < 0.3 * s_ext:
+                        dist_out += s_ext
+                    while dist_out <= 2.4 * pitch:
+                        if not _admit(b[0] + ux * dist_out, b[1] + uy * dist_out,
+                                      req, sink, probe=True):
+                            break
+                        dist_out += s_ext
+    return band, center, dropped
+
+
 def _corner_anchor_pass(shape: ShapeGeometry, segs, existing, hole_dia: float,
                         pitch: float, margin: float, flex: float):
     """Add a hole at any sharp corner (letter apex) the fill left bare."""
@@ -1223,29 +1540,31 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
     ring_excl = 0.8 * pitch
 
     if spacing_flex > 0.0:
-        # Elastic lattice mode: one lattice, globally scaled/aligned (±flex,
-        # angle preserved) and locally relaxed, replaces the grid/nudge stack.
+        # Letter-aware mode. Stroke-width zones are filled first with rows
+        # that follow the stroke (equal widths -> identical fill); zones wider
+        # than the stroke regime get the elastic lattice.
+        band, center, s_dropped = stroke_band_fill(
+            shape, segs, hole_dia, pitch, pattern, stagger_angle, margin,
+            spacing_flex, narrow_relax=narrow_fill, avoid=contour or None,
+        )
+        dropped += s_dropped
+        stroke_pts = band + center
         fill, moved, e_dropped = elastic_lattice_fill(
             shape, segs, hole_dia, pitch, pattern, stagger_angle, margin,
-            spacing_flex, avoid=contour if contour else None,
-            avoid_dist=ring_excl if contour else 0.0,
+            spacing_flex, avoid=(contour + stroke_pts) or None,
+            avoid_dist=ring_excl,
         )
         dropped += e_dropped
-        holes = list(contour) + fill
-        holes += _corner_anchor_pass(shape, segs, holes, hole_dia, pitch, margin, spacing_flex)
-        midline = []
-        if narrow_fill:
-            midline, m_dropped = _midline_rescue(
-                shape, segs, contour, holes[len(contour):], hole_dia, pitch, margin
-            )
-            dropped += m_dropped
-            holes.extend(midline)
+        holes = list(contour) + band + fill
+        holes += _corner_anchor_pass(shape, segs, holes + center, hole_dia, pitch,
+                                     margin, spacing_flex)
+        holes += center
         if len(holes) > MAX_HOLES:
             raise ValueError(
                 f"Pattern produced {len(holes):,} holes (limit {MAX_HOLES:,}). "
                 "Increase the pitch or shrink the shape."
             )
-        return InfillResult(holes, moved, dropped, contour=len(contour), midline=len(midline))
+        return InfillResult(holes, moved, dropped, contour=len(contour), midline=len(center))
 
     def _grid_eval(raw):
         """(fits mask, inside, min_d, pts) for a candidate grid, ring-aware."""
