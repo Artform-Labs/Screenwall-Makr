@@ -19,9 +19,11 @@ from gcode_export import GCodeConfig, doc_to_gcode, doc_to_gcode_combo
 from gcode_import import parse_gcode, paths_to_document, summarize
 from pdf_preview import doc_to_pdf, paths_to_pdf
 from shape_infill import (
+    MIN_PITCH_FACTOR,
     MM_PER_IN,
     PDF_PT_PER_IN,
     SVG_PX_PER_IN,
+    analyze_strokes,
     build_infill_document,
     infill_hole_centers,
     load_shape,
@@ -582,7 +584,7 @@ if shape_uploads:
                  "Same hole size, slightly off-grid. 0 disables.",
         )
     s_nudge = s_pitch * s_nudge_pct / 100.0
-    t1, t2, _sp = st.columns([1.4, 1.2, 3])
+    t1, t2, t3, t4 = st.columns([1.3, 1.1, 1.4, 1.5])
     with t1:
         s_perimeter = st.checkbox(
             "Perimeter outline row", value=True,
@@ -596,6 +598,21 @@ if shape_uploads:
             "Auto-align grid", value=True,
             help="Slides the interior grid alignment (never the spacing) to the "
                  "position that fits the most holes inside the shape.",
+        )
+    with t3:
+        s_narrow = st.checkbox(
+            "Fill narrow strokes", value=True,
+            help="Where a stroke is too narrow for grid rows between the perimeter "
+                 "rows, chain holes down the stroke's centerline instead. In the "
+                 "very narrowest zones the edge margin may relax to half so the "
+                 "form stays covered.",
+        )
+    with t4:
+        s_autofit = st.checkbox(
+            "Auto-fit pitch to strokes", value=False,
+            help="Measures the typical stroke width and tightens the pitch (never "
+                 f"below {MIN_PITCH_FACTOR}× hole Ø, never looser than entered) so "
+                 "at least 3 hole rows span the typical stroke.",
         )
 
 for shape_file in shape_uploads or []:
@@ -654,12 +671,48 @@ for shape_file in shape_uploads or []:
                 st.warning(w_msg)
 
             ew, eh = shape.extents
+
+            file_pitch = s_pitch
+            stroke = analyze_strokes(shape, s_hole_dia, s_pitch, s_margin)
+            if stroke is not None:
+                if s_autofit and stroke.fit_pitch is not None and stroke.fit_pitch < s_pitch:
+                    file_pitch = stroke.fit_pitch
+                    st.info(
+                        f"Auto-fit: pitch tightened {s_pitch}″ → **{file_pitch}″** so "
+                        f"~3 rows span the typical {stroke.median_width}″ stroke."
+                    )
+                stroke_now = analyze_strokes(shape, s_hole_dia, file_pitch, s_margin)
+                msg = (
+                    f"**Stroke analysis:** typical {stroke_now.median_width}″ wide "
+                    f"(thin {stroke_now.thin_width}″) → ~**{stroke_now.rows_typical} rows** "
+                    f"across the typical stroke, ~{stroke_now.rows_thin} across thin ones."
+                )
+                if stroke_now.rows_typical < 3:
+                    if stroke.fit_pitch is not None and stroke.fit_pitch < file_pitch:
+                        msg += (
+                            f" For 3 rows: set pitch ≤ **{stroke.fit_pitch}″** "
+                            "(or enable Auto-fit pitch)."
+                        )
+                    elif stroke.fit_scale is not None:
+                        msg += (
+                            f" Even at the tightest pitch this hole Ø can't reach 3 rows — "
+                            f"scale the artwork up ~**{stroke.fit_scale}×** "
+                            "(or use a smaller hole)."
+                        )
+                    st.warning(msg)
+                else:
+                    st.caption(msg)
+
             result = infill_hole_centers(
-                shape, s_hole_dia, s_pitch, s_pattern, s_angle, s_margin,
-                nudge_max=s_nudge, perimeter_row=s_perimeter, optimize_grid=s_optimize,
+                shape, s_hole_dia, file_pitch, s_pattern, s_angle, s_margin,
+                nudge_max=file_pitch * s_nudge_pct / 100.0,
+                perimeter_row=s_perimeter, optimize_grid=s_optimize,
+                narrow_fill=s_narrow,
             )
             nudge_note = (
                 f" · **Perimeter row:** {result.contour}" if result.contour else ""
+            ) + (
+                f" · **Centerline (narrow strokes):** {result.midline}" if result.midline else ""
             ) + (
                 f" · **Nudged in to fit:** {result.nudged}" if result.nudged else ""
             ) + (

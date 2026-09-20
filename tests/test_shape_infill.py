@@ -7,7 +7,9 @@ import pytest
 from pdf_preview import doc_to_pdf
 from shape_infill import (
     InfillResult,
+    MIN_PITCH_FACTOR,
     ShapeGeometry,
+    analyze_strokes,
     build_infill_document,
     contour_hole_centers,
     infill_hole_centers,
@@ -366,6 +368,92 @@ def test_optimize_grid_never_worse_and_valid():
         for a, b in zip(xs, xs[1:]):
             k = (b - a) / 0.6
             assert abs(k - round(k)) < 1e-6
+
+
+def _diag_strip(width, length=8.0):
+    """45° strip of the given perpendicular width — a synthetic thin stroke."""
+    d = length / math.sqrt(2)
+    off = width / math.sqrt(2)
+    return [(0.0, 0.0), (d, d), (d - off, d + off), (-off, off)]
+
+
+def test_analyze_strokes_measures_width():
+    # 10 × 1.2 bar: chords are 1.2 across the long walls (dominant sample)
+    shape = ShapeGeometry([_rect(0, 0, 10, 1.2)])
+    a = analyze_strokes(shape, 0.25, 0.75, 0.15)
+    assert a is not None
+    assert a.median_width == pytest.approx(1.2, abs=0.05)
+    # fit_pitch reaches 3 rows: (w - 2c) / 1.6 with c = 0.275
+    assert a.fit_pitch == pytest.approx((1.2 - 0.55) / 1.6, abs=0.01)
+    assert a.fit_scale is None
+
+
+def test_analyze_strokes_recommends_scale_when_hole_too_big():
+    # 0.8" stroke with a 0.25" hole and 0.15" margin can never host 3 rows
+    shape = ShapeGeometry([_rect(0, 0, 10, 0.8)])
+    a = analyze_strokes(shape, 0.25, 0.75, 0.15)
+    assert a.fit_pitch is None
+    assert a.fit_scale is not None and a.fit_scale > 1.0
+    # applying the recommended scale makes 3 rows reachable
+    scaled = ShapeGeometry(scale_rings(shape.rings, a.fit_scale))
+    a2 = analyze_strokes(scaled, 0.25, 0.75, 0.15)
+    assert a2.fit_pitch is not None
+    assert a2.fit_pitch >= MIN_PITCH_FACTOR * 0.25 - 1e-9
+
+
+def test_analyze_strokes_rows_estimate_wide_shape():
+    shape = ShapeGeometry([_rect(0, 0, 10, 6)])
+    a = analyze_strokes(shape, 0.25, 0.75, 0.15)
+    assert a.rows_typical >= 3
+
+
+def test_midline_rescue_covers_narrow_diagonal_stroke():
+    # 0.7" diagonal stroke: too narrow for grid rows between the perimeter
+    # rings — without rescue the body is bare, with rescue a centerline chain
+    # runs down the stroke.
+    shape = ShapeGeometry([_diag_strip(0.7)])
+    kw = dict(hole_dia=0.25, pitch=0.6, pattern="staggered", stagger_angle=60.0,
+              margin=0.12, nudge_max=0.1, perimeter_row=True)
+    rescued = infill_hole_centers(shape, **kw, narrow_fill=True)
+    assert rescued.midline >= 8
+    # the centerline row owns the narrow zone: no off-center nudged holes
+    assert rescued.nudged == 0
+    # midline holes hug the stroke's medial line: boundary distance ≈ w/2
+    mid = rescued.holes[len(rescued.holes) - rescued.midline:]
+    for x, y in mid:
+        assert _inside(shape, x, y)
+        assert _min_boundary_dist(shape, x, y) == pytest.approx(0.35, abs=0.03)
+    # chain spacing is uniform (consistent to the eye) and never overlapping
+    gaps = [math.hypot(mid[i + 1][0] - mid[i][0], mid[i + 1][1] - mid[i][1])
+            for i in range(len(mid) - 1)]
+    assert max(gaps) - min(gaps) < 0.05
+    pts = rescued.holes
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+            assert d >= 0.25 * 1.05 - 1e-9
+
+
+def test_midline_rescue_relaxes_margin_in_narrowest_zones():
+    # 0.45" stroke: full clearance (0.12 + 0.125 = 0.245 each side → needs
+    # 0.49") is impossible, but relaxed clearance (0.125 + 0.06) fits.
+    shape = ShapeGeometry([_diag_strip(0.45)])
+    res = infill_hole_centers(shape, 0.25, 0.6, "staggered", 60.0, 0.12,
+                              perimeter_row=True, narrow_fill=True)
+    assert res.midline >= 5
+    relaxed = 0.125 + 0.06
+    for x, y in res.holes[len(res.holes) - res.midline:]:
+        assert _min_boundary_dist(shape, x, y) >= relaxed - 1e-6
+
+
+def test_midline_rescue_skips_wide_shapes():
+    shape = ShapeGeometry([_rect(0, 0, 10, 6)])
+    res = infill_hole_centers(shape, 0.25, 0.6, "staggered", 60.0, 0.15,
+                              perimeter_row=True, narrow_fill=True)
+    wide_only = infill_hole_centers(shape, 0.25, 0.6, "staggered", 60.0, 0.15,
+                                    perimeter_row=True)
+    assert res.midline == 0
+    assert len(res.holes) == len(wide_only.holes)
 
 
 def test_scale_rings():

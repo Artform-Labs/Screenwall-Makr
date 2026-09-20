@@ -82,6 +82,23 @@ class InfillResult:
     nudged: int          # how many of `holes` were shifted to fit
     dropped: int         # candidates near the edge that could not fit
     contour: int = 0     # holes in the perimeter outline row (first in `holes`)
+    midline: int = 0     # centerline rescue holes in narrow strokes (last in `holes`)
+
+
+@dataclass
+class StrokeAnalysis:
+    """Chord-based stroke width statistics + coverage guidance.
+
+    Widths are perpendicular chords cast inward from the boundary, so they
+    measure the actual body of each stroke (letter stems, bars, ring bands).
+    """
+    median_width: float          # typical stroke width (inches)
+    thin_width: float            # 10th-percentile stroke width (inches)
+    rows_typical: int            # estimated hole rows across the typical stroke
+    rows_thin: int               # estimated hole rows across the thin strokes
+    fit_pitch: float | None      # pitch that reaches 3 rows across the typical
+                                 # stroke, or None if the hole is too big for that
+    fit_scale: float | None      # or: scale-up factor for the current pitch
 
 
 # ---------------------------------------------------------------------------
@@ -803,10 +820,17 @@ def contour_hole_centers(shape: ShapeGeometry, hole_dia: float, spacing: float,
             return
         kept.append((x, y))
 
+    # Two facing wall rows need this much local stroke width; below it a
+    # single centerline row (narrow_fill) reads better than colliding rings.
+    two_row_min = 2.0 * clearance + 1.05 * hole_dia
+
     for cand in anchors:                      # corners first: they anchor the form
         _admit(cand)
     for sx, sy, nx, ny in stations:
         ix, iy = _inward_dir(sx, sy, nx, ny, segs, clearance * 0.25)
+        w = _chord_width(sx, sy, ix, iy, segs)
+        if w is not None and w < two_row_min:
+            continue                          # leave the zone to the midline row
         _admit((sx + ix * clearance, sy + iy * clearance))
     return kept, dropped
 
@@ -839,10 +863,135 @@ def _grid_candidates(shape: ShapeGeometry, hole_dia, pitch, pattern, stagger_ang
     return out
 
 
+# Tightest manufacturable pitch, as a multiple of hole diameter (web ≈ 0.2×Ø).
+MIN_PITCH_FACTOR = 1.2
+# Grid rows must sit at least this fraction of pitch from the perimeter ring
+# (shared by the exclusion zone and the rows-across estimate).
+RING_EXCLUSION_FACTOR = 0.8
+
+
+def _chord_width(px, py, dx, dy, segs):
+    """Length of the inward chord from boundary point (px,py) along (dx,dy):
+    the local stroke width. Returns None if the ray never exits (bad normal)."""
+    sx0, sy0, sx1, sy1 = segs
+    ex = sx1 - sx0
+    ey = sy1 - sy0
+    denom = dx * ey - dy * ex
+    ax = sx0 - px
+    ay = sy0 - py
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (ax * ey - ay * ex) / denom
+        s = (ax * dy - ay * dx) / denom
+    valid = (np.abs(denom) > 1e-12) & (s >= -1e-9) & (s <= 1.0 + 1e-9) & (t > 1e-6)
+    if not np.any(valid):
+        return None
+    return float(np.min(t[valid]))
+
+
+def _boundary_chords(shape: ShapeGeometry, segs, step: float):
+    """(x, y, nx, ny, width) chords sampled around every ring at ~step spacing."""
+    out = []
+    for ring in shape.rings:
+        for sx, sy, nx, ny in _loop_stations(ring, step):
+            ix, iy = _inward_dir(sx, sy, nx, ny, segs, 1e-4)
+            w = _chord_width(sx, sy, ix, iy, segs)
+            if w is not None:
+                out.append((sx, sy, ix, iy, w))
+    return out
+
+
+def analyze_strokes(shape: ShapeGeometry, hole_dia: float, pitch: float,
+                    margin: float) -> StrokeAnalysis | None:
+    """Measure stroke widths and derive what it takes to get 3 rows across.
+
+    Rows across a stroke of width ``w``: the two perimeter-ring rows sit at
+    ``clearance`` from each wall, and interior rows need
+    ``RING_EXCLUSION_FACTOR × pitch`` of room, so
+    ``rows ≈ 2 + floor((w − 2·clearance) / (RING_EXCLUSION_FACTOR·pitch)) − 1``
+    (bounded below by what physically fits).
+    """
+    segs = _segment_arrays(shape.rings)
+    step = max(min(pitch, 0.5), sum(shape.extents) / 400.0)
+    widths = np.asarray([c[4] for c in _boundary_chords(shape, segs, step)])
+    if len(widths) == 0:
+        return None
+    med = float(np.median(widths))
+    thin = float(np.percentile(widths, 10))
+    clearance = margin + hole_dia / 2.0
+
+    def rows(w):
+        if w < hole_dia + margin:            # not even one relaxed hole
+            return 0
+        if w < 2.0 * clearance + 1.05 * hole_dia:
+            return 1                          # single (center) row territory
+        return 2 + max(0, int((w - 2.0 * clearance) / (RING_EXCLUSION_FACTOR * pitch)) - 1)
+
+    fit_pitch = (med - 2.0 * clearance) / (2.0 * RING_EXCLUSION_FACTOR)
+    floor_pitch = MIN_PITCH_FACTOR * hole_dia
+    if fit_pitch >= floor_pitch:
+        fit_pitch = round(min(fit_pitch, pitch), 4)
+        fit_scale = None
+    else:
+        # Even the tightest pitch can't reach 3 rows: the artwork must grow.
+        need_w = 2.0 * clearance + 2.0 * RING_EXCLUSION_FACTOR * floor_pitch
+        fit_pitch = None
+        fit_scale = round(need_w / max(med, 1e-9), 2)
+    return StrokeAnalysis(round(med, 3), round(thin, 3), rows(med), rows(thin),
+                          fit_pitch, fit_scale)
+
+
+def _midline_rescue(shape: ShapeGeometry, segs, ring_holes, other_holes,
+                    hole_dia: float, pitch: float, margin: float):
+    """Centerline row through strokes too narrow for interior grid rows.
+
+    Anywhere the local stroke width leaves no room between the perimeter-ring
+    rows, chain holes down the stroke's medial line at ~pitch spacing. Edge
+    clearance may relax down to ``hole_r + margin/2`` in the narrowest zones —
+    coverage of the form beats nominal margin there. Returns (added, dropped).
+    """
+    clearance = margin + hole_dia / 2.0
+    relaxed = hole_dia / 2.0 + margin * 0.5
+    hr = hole_dia / 2.0
+    # Only strokes too narrow for a grid row between the rings need rescue.
+    narrow_limit = 2.0 * clearance + 2.0 * RING_EXCLUSION_FACTOR * pitch
+    ring_arr = np.asarray(ring_holes, dtype=float) if ring_holes else None
+    other_arr = np.asarray(other_holes, dtype=float) if other_holes else None
+    min_cc = 1.05 * hole_dia
+
+    added, dropped = [], 0
+    step = min(pitch / 2.0, 0.5)
+    for ring in shape.rings:
+        for sx, sy, nx, ny in _loop_stations(ring, step):
+            ix, iy = _inward_dir(sx, sy, nx, ny, segs, 1e-4)
+            w = _chord_width(sx, sy, ix, iy, segs)
+            if w is None or w >= narrow_limit or w < hole_dia + margin:
+                continue
+            mx, my = sx + ix * w / 2.0, sy + iy * w / 2.0
+            # Skip zones the grid already covers.
+            if other_arr is not None and len(other_arr) and np.min(
+                (other_arr[:, 0] - mx) ** 2 + (other_arr[:, 1] - my) ** 2
+            ) < (0.75 * pitch) ** 2:
+                continue
+            req = clearance if w >= 2.0 * clearance + min_cc else max(relaxed, hr + 1e-4)
+            if not _fits_one(mx, my, segs, req):
+                dropped += 1
+                continue
+            if any((mx - axx) ** 2 + (my - ayy) ** 2 < (0.85 * pitch) ** 2
+                   for axx, ayy in added):
+                continue
+            if ring_arr is not None and len(ring_arr) and np.min(
+                (ring_arr[:, 0] - mx) ** 2 + (ring_arr[:, 1] - my) ** 2
+            ) < min_cc * min_cc:
+                dropped += 1
+                continue
+            added.append((mx, my))
+    return added, dropped
+
+
 def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
                         pattern: str, stagger_angle: float, margin: float,
                         nudge_max: float = 0.0, perimeter_row: bool = False,
-                        optimize_grid: bool = False) -> InfillResult:
+                        optimize_grid: bool = False, narrow_fill: bool = False) -> InfillResult:
     """Hole grid over the shape bbox, filtered to holes that fully fit inside.
 
     Same grid math and margin semantics as the panel face (`_hole_centers`):
@@ -860,6 +1009,10 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
     ``optimize_grid`` sweeps the grid phase (a 4×4 lattice of offsets plus
     the default centered grid) and keeps the alignment that fits the most
     holes — spacing is untouched, so there is zero visual cost.
+
+    ``narrow_fill`` chains a centerline row through strokes too narrow for
+    grid rows between the perimeter rings (see `_midline_rescue`); use
+    `analyze_strokes` to see measured widths and pitch/scale guidance.
     """
     if hole_dia <= 0 or pitch <= 0:
         raise ValueError("hole diameter and pitch must be positive")
@@ -921,19 +1074,44 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
             continue
         if best is None or int(np.sum(ev[4])) > int(np.sum(best[4])):
             best = ev
-    if best is None:
-        return InfillResult(list(contour), 0, dropped, contour=len(contour))
-    raw, pts, inside, min_d, fits, near_ring = best
 
-    holes = list(contour) + [(float(x), float(y)) for (x, y), ok in zip(raw, fits) if ok]
+    # Local stroke width below which the centerline row owns the zone: grid
+    # and nudged holes there sit off-center and read as jitter.
+    narrow_limit = 2.0 * clearance + 2.0 * RING_EXCLUSION_FACTOR * pitch
+
+    def _in_narrow_zone(i, pts, inside, min_d, qx, qy):
+        if min_d[i] >= narrow_limit / 2.0:
+            return False
+        vx, vy = pts[i, 0] - qx[i], pts[i, 1] - qy[i]
+        norm = math.hypot(vx, vy)
+        if norm < 1e-12:
+            return False
+        if not inside[i]:
+            vx, vy = -vx, -vy
+        w = _chord_width(float(qx[i]), float(qy[i]), vx / norm, vy / norm, segs)
+        return w is not None and w < narrow_limit
+
+    if best is not None:
+        raw, pts, inside, min_d, fits, near_ring = best
+        qx = qy = None
+        if narrow_fill:
+            inside, min_d, qx, qy = _classify_centers(pts, segs)
+            for i in np.nonzero(fits)[0]:
+                if _in_narrow_zone(i, pts, inside, min_d, qx, qy):
+                    fits[i] = False
+        holes = list(contour) + [(float(x), float(y)) for (x, y), ok in zip(raw, fits) if ok]
+    else:
+        holes = list(contour)
 
     nudged = 0
-    if nudge_max > 0.0:
+    if best is not None and nudge_max > 0.0:
         signed = np.where(inside, min_d, -min_d)
         needed = clearance - signed
         eligible = (~fits) & (~near_ring) & (needed <= nudge_max + 1e-9)
         min_cc = hole_dia * 1.05  # never let a nudged hole overlap a neighbor
         for i in np.nonzero(eligible)[0]:
+            if narrow_fill and _in_narrow_zone(i, pts, inside, min_d, qx, qy):
+                continue                      # centerline row owns this zone
             moved = _try_nudge(pts[i, 0], pts[i, 1], segs, clearance, nudge_max)
             if moved is None:
                 dropped += 1
@@ -950,12 +1128,21 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
             holes.append((mx, my))
             nudged += 1
         dropped += int(np.sum((~fits) & (~near_ring) & (needed > nudge_max + 1e-9) & (signed > -clearance)))
+
+    midline = []
+    if narrow_fill:
+        midline, m_dropped = _midline_rescue(
+            shape, segs, contour, holes[len(contour):], hole_dia, pitch, margin
+        )
+        dropped += m_dropped
+        holes.extend(midline)
+
     if len(holes) > MAX_HOLES:
         raise ValueError(
             f"Pattern produced {len(holes):,} holes (limit {MAX_HOLES:,}). "
             "Increase the pitch or shrink the shape."
         )
-    return InfillResult(holes, nudged, dropped, contour=len(contour))
+    return InfillResult(holes, nudged, dropped, contour=len(contour), midline=len(midline))
 
 
 # ---------------------------------------------------------------------------
