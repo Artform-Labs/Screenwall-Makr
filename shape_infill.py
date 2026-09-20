@@ -83,6 +83,7 @@ class InfillResult:
     dropped: int         # candidates near the edge that could not fit
     contour: int = 0     # holes in the perimeter outline row (first in `holes`)
     midline: int = 0     # centerline rescue holes in narrow strokes (last in `holes`)
+    pitch_used: float | None = None  # working pitch after auto-fit (None = as entered)
 
 
 @dataclass
@@ -1366,6 +1367,13 @@ def stroke_band_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: float,
         return True
 
     s_lo, s_hi = max(0.7, 1.0 - flex - 0.1), min(1.35, 1.0 + flex + 0.15)
+    # Physical floor for the cross-stroke row gap: adjacent rows are placed
+    # half a spacing out of phase, so their true center distance is the
+    # diagonal hypot(gap, pitch/2) — the gap alone may be tighter than Ø+5%.
+    if pattern == "staggered":
+        g_floor = math.sqrt(max((1.05 * hole_dia) ** 2 - (pitch / 2.0) ** 2, 0.0))
+    else:
+        g_floor = 1.05 * hole_dia
     for ch, closed in chains:
         sm = _smooth_chain(ch, closed)
         w_rel = sm[:, 2][sm[:, 2] <= limit]
@@ -1374,7 +1382,7 @@ def stroke_band_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: float,
         k = 1
         if avail > 1e-9:
             k = int(round(avail / g_nom)) + 1
-            while k > 1 and avail / (k - 1) < max(1.05 * hole_dia, 0.72 * g_nom):
+            while k > 1 and avail / (k - 1) < max(g_floor, 0.72 * g_nom):
                 k -= 1
             k = max(1, k)
         if k == 1 and narrow_relax and w_med < 2.0 * clearance + 1.05 * hole_dia:
@@ -1382,6 +1390,7 @@ def stroke_band_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: float,
         else:
             req = clearance
         sink = band if k >= 2 else center
+        polys = []
         for j in range(k):
             if k == 1:
                 # true medial centerline
@@ -1399,13 +1408,29 @@ def stroke_band_fill(shape: ShapeGeometry, segs, hole_dia: float, pitch: float,
                     d = clearance + frac * span
                     poly.append((x - ix * w / 2.0 + ix * d,
                                  y - iy * w / 2.0 + iy * d))
+            polys.append(poly)
+
+        def _poly_len(poly):
             m = len(poly) if closed else len(poly) - 1
-            L = sum(math.hypot(poly[(i + 1) % len(poly)][0] - poly[i][0],
-                               poly[(i + 1) % len(poly)][1] - poly[i][1])
-                    for i in range(m))
+            return sum(math.hypot(poly[(i + 1) % len(poly)][0] - poly[i][0],
+                                  poly[(i + 1) % len(poly)][1] - poly[i][1])
+                       for i in range(m))
+
+        lengths = [_poly_len(p) for p in polys]
+        n_closed = None
+        if closed and k >= 2 and avail / (k - 1) < 1.3 * r_admit:
+            # Rings sit close enough to collide: use ONE hole count for ALL of
+            # them (from the middle ring), alternate rings half-phased — a true
+            # stagger everywhere, adjacent rings can never drift into radial
+            # alignment. Widely separated rings keep their own per-ring count
+            # at true pitch instead.
+            l_mid = (lengths[(k - 1) // 2] + lengths[k // 2]) / 2.0
+            n_closed = max(3, round(l_mid / pitch))
+        for j, poly in enumerate(polys):
+            L = lengths[j]
             half = j % 2 == 1
             if closed:
-                n_h = max(3, round(L / pitch))
+                n_h = n_closed if n_closed is not None else max(3, round(L / pitch))
                 s = L / n_h
                 dists = [(i + (0.5 if half else 0.0)) * s for i in range(n_h)]
             else:
@@ -1482,7 +1507,8 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
                         pattern: str, stagger_angle: float, margin: float,
                         nudge_max: float = 0.0, perimeter_row: bool = False,
                         optimize_grid: bool = False, narrow_fill: bool = False,
-                        spacing_flex: float = 0.0) -> InfillResult:
+                        spacing_flex: float = 0.0, auto_pitch: bool = False,
+                        target_rows: int = 3) -> InfillResult:
     """Hole grid over the shape bbox, filtered to holes that fully fit inside.
 
     Same grid math and margin semantics as the panel face (`_hole_centers`):
@@ -1505,16 +1531,46 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
     grid rows between the perimeter rings (see `_midline_rescue`); use
     `analyze_strokes` to see measured widths and pitch/scale/Ø guidance.
 
-    ``spacing_flex`` > 0 switches the fill to the elastic lattice
-    (`elastic_lattice_fill`): one lattice that keeps the stagger angle but may
-    scale/slide/deform locally within ±flex, giving even fill with edge holes
-    hugging the outline. Replaces the grid + nudge stack (``nudge_max`` and
-    ``optimize_grid`` are ignored); the fraction is of pitch (e.g. 0.15).
+    ``spacing_flex`` > 0 switches to the letter-aware fill: stroke-width zones
+    get rows that follow the stroke (`stroke_band_fill`; equal stroke widths
+    => identical fill), wider zones get the elastic lattice
+    (`elastic_lattice_fill`). Replaces the grid + nudge stack (``nudge_max``
+    and ``optimize_grid`` are ignored); the fraction is of pitch (e.g. 0.15).
+
+    ``auto_pitch`` (letter-aware mode only) makes the adjustment itself
+    instead of only reporting it: the working pitch is tightened — never
+    loosened, floored at ``MIN_PITCH_FACTOR × Ø`` — so ``target_rows`` rows
+    span the typical measured stroke. The pitch actually used is returned in
+    ``InfillResult.pitch_used`` (None when unchanged).
     """
     if hole_dia <= 0 or pitch <= 0:
         raise ValueError("hole diameter and pitch must be positive")
     if pitch < hole_dia:
         raise ValueError("pitch must be >= hole diameter (holes would overlap)")
+
+    segs = _segment_arrays(shape.rings)
+    clearance = margin + hole_dia / 2.0
+
+    pitch_used = None
+    if spacing_flex > 0.0 and auto_pitch:
+        row_f = math.sin(math.radians(stagger_angle)) if pattern == "staggered" else 1.0
+        step_a = max(min(pitch, 0.5), sum(shape.extents) / 400.0)
+        widths = np.asarray([c[4] for c in _boundary_chords(shape, segs, step_a)])
+        # Fit to the thinner strokes (25th pct of stroke-regime chords), not the
+        # overall median: caps/junction chords would loosen the fit, and wide
+        # strokes only gain rows — full infill everywhere.
+        strokes = widths[widths <= 2.0 * clearance + 3.4 * pitch * row_f]
+        if len(strokes) < 8:
+            strokes = widths
+        if len(strokes):
+            avail = float(np.percentile(strokes, 25)) - 2.0 * clearance
+            if avail > 0:
+                p_fit = max(avail / (max(target_rows - 1, 1) * row_f),
+                            MIN_PITCH_FACTOR * hole_dia)
+                if p_fit < pitch:
+                    pitch = p_fit
+                    pitch_used = round(p_fit, 4)
+
     x0, y0, x1, y1 = shape.bbox
     w, h = x1 - x0, y1 - y0
 
@@ -1527,9 +1583,6 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
             f"Pattern would generate ~{int(est):,} candidate holes "
             f"(limit {MAX_GRID_CANDIDATES:,}). Increase the pitch or shrink the shape."
         )
-
-    segs = _segment_arrays(shape.rings)
-    clearance = margin + hole_dia / 2.0
 
     contour, dropped = [], 0
     if perimeter_row:
@@ -1564,7 +1617,8 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
                 f"Pattern produced {len(holes):,} holes (limit {MAX_HOLES:,}). "
                 "Increase the pitch or shrink the shape."
             )
-        return InfillResult(holes, moved, dropped, contour=len(contour), midline=len(center))
+        return InfillResult(holes, moved, dropped, contour=len(contour),
+                            midline=len(center), pitch_used=pitch_used)
 
     def _grid_eval(raw):
         """(fits mask, inside, min_d, pts) for a candidate grid, ring-aware."""

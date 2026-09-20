@@ -604,13 +604,19 @@ if shape_uploads:
         )
     with t3:
         s_autofit = st.checkbox(
-            "Auto-fit pitch to strokes", value=False,
-            help="Measures the typical stroke width and tightens the pitch (never "
-                 f"below {MIN_PITCH_FACTOR}× hole Ø, never looser than entered) so "
-                 "at least 3 hole rows span the typical stroke.",
+            "Auto-fit pitch to strokes", value=True,
+            help="Makes the adjustment for you: measures the typical stroke width "
+                 "and tightens the working pitch (never below "
+                 f"{MIN_PITCH_FACTOR}× hole Ø, never looser than entered) so the "
+                 "target rows span the typical stroke — full infill that reflects "
+                 "the letter. The pitch actually used is reported.",
         )
     with t4:
-        st.empty()
+        s_rows = st.number_input(
+            "Rows across stroke", value=3, min_value=2, max_value=6, step=1,
+            help="Auto-fit target: how many hole rows should span the typical "
+                 "stroke. More rows = denser fill (pitch permitting).",
+        )
 
 for shape_file in shape_uploads or []:
     fkey = shape_file.name
@@ -669,45 +675,43 @@ for shape_file in shape_uploads or []:
 
             ew, eh = shape.extents
 
-            file_pitch = s_pitch
             stroke = analyze_strokes(shape, s_hole_dia, s_pitch, s_margin)
             if stroke is not None:
-                if s_autofit and stroke.fit_pitch is not None and stroke.fit_pitch < s_pitch:
-                    file_pitch = stroke.fit_pitch
-                    st.info(
-                        f"Auto-fit: pitch tightened {s_pitch}″ → **{file_pitch}″** so "
-                        f"~3 rows span the typical {stroke.median_width}″ stroke."
-                    )
-                stroke_now = analyze_strokes(shape, s_hole_dia, file_pitch, s_margin)
                 msg = (
-                    f"**Stroke analysis:** typical {stroke_now.median_width}″ wide "
-                    f"(thin {stroke_now.thin_width}″) → ~**{stroke_now.rows_typical} rows** "
-                    f"across the typical stroke, ~{stroke_now.rows_thin} across thin ones."
+                    f"**Stroke analysis:** typical {stroke.median_width}″ wide "
+                    f"(thin {stroke.thin_width}″)."
                 )
-                if stroke_now.rows_typical < 3:
-                    if stroke.fit_pitch is not None and stroke.fit_pitch < file_pitch:
+                if not s_autofit and stroke.rows_typical < 3:
+                    if stroke.fit_pitch is not None and stroke.fit_pitch < s_pitch:
                         msg += (
-                            f" For 3 rows: set pitch ≤ **{stroke.fit_pitch}″** "
-                            "(or enable Auto-fit pitch)."
+                            f" Only ~{stroke.rows_typical} rows at this pitch — set "
+                            f"pitch ≤ **{stroke.fit_pitch}″** or enable Auto-fit."
                         )
-                    elif stroke.fit_scale is not None:
-                        msg += (
-                            f" Even at the tightest pitch this hole Ø can't reach 3 rows — "
-                            f"scale the artwork up ~**{stroke.fit_scale}×**"
-                        )
-                        if stroke.fit_dia is not None:
-                            msg += f" or drop to hole **Ø ≤ {stroke.fit_dia}″** (at pitch 2×Ø)"
-                        msg += "."
                     st.warning(msg)
                 else:
                     st.caption(msg)
+                if stroke.fit_scale is not None:
+                    warn = (
+                        f"This hole Ø physically can't reach 3 rows across the "
+                        f"{stroke.median_width}″ stroke even at the tightest pitch — "
+                        f"scale the artwork up ~**{stroke.fit_scale}×**"
+                    )
+                    if stroke.fit_dia is not None:
+                        warn += f" or drop to hole **Ø ≤ {stroke.fit_dia}″** (at pitch 2×Ø)"
+                    st.warning(warn + ".")
 
             result = infill_hole_centers(
-                shape, s_hole_dia, file_pitch, s_pattern, s_angle, s_margin,
-                nudge_max=file_pitch * s_flex_pct / 100.0,
+                shape, s_hole_dia, s_pitch, s_pattern, s_angle, s_margin,
+                nudge_max=s_pitch * s_flex_pct / 100.0,
                 perimeter_row=s_perimeter, optimize_grid=True,
                 narrow_fill=s_narrow, spacing_flex=s_flex_pct / 100.0,
+                auto_pitch=s_autofit, target_rows=int(s_rows),
             )
+            if result.pitch_used is not None:
+                st.info(
+                    f"Auto-fit: pitch tightened {s_pitch}″ → **{result.pitch_used}″** "
+                    f"so {int(s_rows)} rows span the typical stroke."
+                )
             nudge_note = (
                 f" · **Perimeter row:** {result.contour}" if result.contour else ""
             ) + (

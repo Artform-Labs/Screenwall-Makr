@@ -609,6 +609,33 @@ def test_stroke_fill_annulus_two_uniform_rings():
         assert max(gaps) / min(gaps) < 1.35
 
 
+def test_auto_pitch_full_infill():
+    """auto_pitch makes the adjustment itself: the working pitch tightens so
+    the target rows span the typical stroke — full infill, reported back."""
+    shape = ShapeGeometry([_letter_n()])
+    res = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                              narrow_fill=True, spacing_flex=0.15,
+                              auto_pitch=True, target_rows=3)
+    # 1.0" stroke, clearance 0.21875: (1.0 - 0.4375) / (2 sin 60) = 0.3248
+    assert res.pitch_used == pytest.approx(0.3248, abs=1e-3)
+    assert res.pitch_used >= MIN_PITCH_FACTOR * 0.25
+    # stems now carry three straight columns each
+    left = _column_xs(res.holes, 0.0, 1.0, 0.3, 2.4)
+    right = _column_xs(res.holes, 2.6, 3.6, 2.6, 4.7)
+    assert len(left) == 3 and len(right) == 3
+    for col in left + right:
+        assert max(col) - min(col) < 0.05
+    # substantially denser than without auto-fit
+    base = infill_hole_centers(shape, 0.25, 0.5, "staggered", 60.0, 0.09375,
+                               narrow_fill=True, spacing_flex=0.15)
+    assert len(res.holes) > 1.5 * len(base.holes)
+    # never loosens: a fine pitch stays as entered
+    fine = infill_hole_centers(shape, 0.25, 0.31, "staggered", 60.0, 0.09375,
+                               narrow_fill=True, spacing_flex=0.15,
+                               auto_pitch=True, target_rows=3)
+    assert fine.pitch_used is None
+
+
 def test_stroke_fill_thin_stroke_single_centerline():
     """A stroke too narrow for two rows gets one centered chain (flex mode)."""
     shape = ShapeGeometry([_rect(0, 0, 0.55, 4.0)])
