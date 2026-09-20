@@ -81,6 +81,7 @@ class InfillResult:
     holes: list[tuple[float, float]]
     nudged: int          # how many of `holes` were shifted to fit
     dropped: int         # candidates near the edge that could not fit
+    contour: int = 0     # holes in the perimeter outline row (first in `holes`)
 
 
 # ---------------------------------------------------------------------------
@@ -612,9 +613,236 @@ def _try_nudge(px, py, segs, clearance, budget):
     return (px, py) if inside[0] and d[0] >= clearance - 1e-9 else None
 
 
+# Corner detection: direction change sharper than this is an anchored corner.
+CORNER_TURN_DEG = 40.0
+# Per-edge justified spacing may deviate from pitch by at most this fraction
+# before an edge gains/loses a hole instead.
+CONTOUR_SPACING_FLEX = 0.5
+
+
+def _fits_one(px, py, segs, clearance):
+    inside, d, _, _ = _classify_centers(np.array([[px, py]]), segs)
+    return bool(inside[0]) and float(d[0]) >= clearance - 1e-9
+
+
+def _inward_dir(px, py, nx, ny, segs, probe):
+    """Orient a unit normal so it points into the filled region (even-odd probe)."""
+    inside, _, _, _ = _classify_centers(np.array([[px + nx * probe, py + ny * probe]]), segs)
+    return (nx, ny) if inside[0] else (-nx, -ny)
+
+
+def _ring_corners(ring):
+    """Indices of vertices whose direction change exceeds CORNER_TURN_DEG."""
+    n = len(ring)
+    corners = []
+    for i in range(n):
+        ax, ay = ring[i - 1]
+        bx, by = ring[i]
+        cx, cy = ring[(i + 1) % n]
+        v1 = (bx - ax, by - ay)
+        v2 = (cx - bx, cy - by)
+        l1 = math.hypot(*v1)
+        l2 = math.hypot(*v2)
+        if l1 < 1e-12 or l2 < 1e-12:
+            continue
+        cosang = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)))
+        if math.degrees(math.acos(cosang)) > CORNER_TURN_DEG:
+            corners.append(i)
+    return corners
+
+
+def _corner_candidate(ring, i, segs, clearance):
+    """Hole center anchoring a sharp corner + its along-edge footprint.
+
+    The center sits on the inward angle bisector, deep enough to clear both
+    edges (clearance / sin(half-angle), capped). Returns
+    ``((x, y), along_trim)`` where ``along_trim`` is how far along each edge
+    the corner hole projects — edge stations are justified over the span
+    *between* corner holes so every gap on the side reads uniform.
+    """
+    n = len(ring)
+    ax, ay = ring[i - 1]
+    bx, by = ring[i]
+    cx, cy = ring[(i + 1) % n]
+    u = (bx - ax, by - ay)
+    v = (cx - bx, cy - by)
+    lu, lv = math.hypot(*u), math.hypot(*v)
+    if lu < 1e-12 or lv < 1e-12:
+        return None, 0.0
+    # Inward normals of the two edges meeting at the corner.
+    nu = _inward_dir((ax + bx) / 2, (ay + by) / 2, -u[1] / lu, u[0] / lu, segs, clearance * 0.25)
+    nv = _inward_dir((bx + cx) / 2, (by + cy) / 2, -v[1] / lv, v[0] / lv, segs, clearance * 0.25)
+    bx_, by_ = nu[0] + nv[0], nu[1] + nv[1]
+    lb = math.hypot(bx_, by_)
+    if lb < 1e-9:
+        return None, 0.0
+    bis = (bx_ / lb, by_ / lb)
+    # Interior half-angle between the edges: sin(half) from the bisector geometry.
+    cosang = max(-1.0, min(1.0, (-(u[0]) * v[0] - u[1] * v[1]) / (lu * lv)))
+    half = max(math.acos(cosang) / 2.0, 1e-3)
+    depth = min(clearance / max(math.sin(half), 1.0 / 3.0), 3.0 * clearance)
+    along_trim = depth * math.cos(half)
+    return (bx + bis[0] * depth, by + bis[1] * depth), along_trim
+
+
+def _edge_stations(ring, i0, i1, spacing, trim0=0.0, trim1=0.0):
+    """Justified stations along ring vertices i0→i1.
+
+    Stations span the arc between the two corner holes' footprints
+    (``trim0``/``trim1`` in from each end) at ``effective / round(effective /
+    spacing)`` so the corner-to-first-hole gap matches the interior gaps.
+    """
+    n_ring = len(ring)
+    pts = [ring[i0]]
+    j = i0
+    while j % n_ring != i1 % n_ring:
+        j += 1
+        pts.append(ring[j % n_ring])
+    seg_len = [math.hypot(pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1])
+               for k in range(len(pts) - 1)]
+    total = sum(seg_len)
+    effective = total - trim0 - trim1
+    if effective < spacing * (1.0 - CONTOUR_SPACING_FLEX):
+        return []
+    n = max(1, round(effective / spacing))
+    out = []
+    for k in range(1, n):
+        target = trim0 + effective * k / n
+        acc = 0.0
+        for s, L in enumerate(seg_len):
+            if acc + L >= target - 1e-12:
+                t = (target - acc) / max(L, 1e-12)
+                x = pts[s][0] + (pts[s + 1][0] - pts[s][0]) * t
+                y = pts[s][1] + (pts[s + 1][1] - pts[s][1]) * t
+                # local inward normal
+                dx, dy = pts[s + 1][0] - pts[s][0], pts[s + 1][1] - pts[s][1]
+                out.append((x, y, -dy / max(L, 1e-12), dx / max(L, 1e-12)))
+                break
+            acc += L
+    return out
+
+
+def _loop_stations(ring, spacing):
+    """Evenly spaced stations around a smooth closed loop (no corners)."""
+    n_ring = len(ring)
+    seg_len = [math.hypot(ring[(k + 1) % n_ring][0] - ring[k][0],
+                          ring[(k + 1) % n_ring][1] - ring[k][1]) for k in range(n_ring)]
+    total = sum(seg_len)
+    if total < spacing * (1.0 - CONTOUR_SPACING_FLEX):
+        return []
+    n = max(3, round(total / spacing))
+    out = []
+    for k in range(n):
+        target = total * k / n
+        acc = 0.0
+        for s in range(n_ring):
+            L = seg_len[s]
+            if acc + L >= target - 1e-12:
+                t = (target - acc) / max(L, 1e-12)
+                p0, p1 = ring[s], ring[(s + 1) % n_ring]
+                x = p0[0] + (p1[0] - p0[0]) * t
+                y = p0[1] + (p1[1] - p0[1]) * t
+                dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+                out.append((x, y, -dy / max(L, 1e-12), dx / max(L, 1e-12)))
+                break
+            acc += L
+    return out
+
+
+def contour_hole_centers(shape: ShapeGeometry, hole_dia: float, spacing: float,
+                         margin: float, nudge_max: float = 0.0):
+    """Perimeter outline row: one hole ring hugging every outline at exact
+    clearance, corner-anchored, spacing justified per edge.
+
+    Sharp corners (letter apexes, stem/crossbar joints) always get a hole —
+    that is what makes the form read. Between corners, holes are spaced
+    evenly at ``total_edge_length / round(length / spacing)`` so each side
+    looks uniform; the per-side deviation from nominal spacing is what a
+    human eye tolerates best. Returns (centers, dropped_count).
+    """
+    segs = _segment_arrays(shape.rings)
+    clearance = margin + hole_dia / 2.0
+    min_cc = max(1.05 * hole_dia, 0.55 * spacing)
+
+    anchors, stations = [], []
+    for ring in shape.rings:
+        corners = _ring_corners(ring)
+        if corners:
+            trims = {}
+            for ci in corners:
+                cand, trim = _corner_candidate(ring, ci, segs, clearance)
+                trims[ci] = trim
+                if cand is not None:
+                    anchors.append(cand)
+            for a, b in zip(corners, corners[1:] + [corners[0] + len(ring)]):
+                stations.extend(_edge_stations(
+                    ring, a % len(ring), b % len(ring), spacing,
+                    trims[a % len(ring)], trims[b % len(ring)],
+                ))
+        else:
+            # Smooth loop (circle / O counter): even stations all the way around.
+            stations.extend(_loop_stations(ring, spacing))
+
+    kept, dropped = [], 0
+    budget = nudge_max if nudge_max > 0 else 0.35 * spacing
+
+    def _admit(cand):
+        nonlocal dropped
+        if cand is None:
+            dropped += 1
+            return
+        x, y = cand
+        if not _fits_one(x, y, segs, clearance):
+            moved = _try_nudge(x, y, segs, clearance, budget)
+            if moved is None:
+                dropped += 1
+                return
+            x, y = moved
+        if any((x - kx) ** 2 + (y - ky) ** 2 < min_cc * min_cc for kx, ky in kept):
+            dropped += 1
+            return
+        kept.append((x, y))
+
+    for cand in anchors:                      # corners first: they anchor the form
+        _admit(cand)
+    for sx, sy, nx, ny in stations:
+        ix, iy = _inward_dir(sx, sy, nx, ny, segs, clearance * 0.25)
+        _admit((sx + ix * clearance, sy + iy * clearance))
+    return kept, dropped
+
+
+def _grid_candidates(shape: ShapeGeometry, hole_dia, pitch, pattern, stagger_angle,
+                     margin, phase=(0.0, 0.0)):
+    """Grid over the shape bbox with an explicit phase offset (for alignment sweeps)."""
+    x0, y0, x1, y1 = shape.bbox
+    hr = hole_dia / 2.0
+    min_x, max_x = x0 + margin + hr, x1 - margin - hr
+    min_y, max_y = y0 + margin + hr, y1 - margin - hr
+    if pattern == "straight":
+        row_step, col_off = pitch, 0.0
+    else:
+        alpha = math.radians(stagger_angle)
+        row_step, col_off = pitch * math.sin(alpha), pitch * math.cos(alpha)
+    out = []
+    y = min_y + (phase[1] % row_step) - row_step
+    row = 0
+    while y <= max_y + 1e-9:
+        if y >= min_y - 1e-9:
+            offset = col_off if row % 2 else 0.0
+            x = min_x + ((phase[0] + offset) % pitch) - pitch
+            while x <= max_x + 1e-9:
+                if x >= min_x - 1e-9:
+                    out.append((x, y))
+                x += pitch
+        y += row_step
+        row += 1
+    return out
+
+
 def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
                         pattern: str, stagger_angle: float, margin: float,
-                        nudge_max: float = 0.0) -> InfillResult:
+                        nudge_max: float = 0.0, perimeter_row: bool = False,
+                        optimize_grid: bool = False) -> InfillResult:
     """Hole grid over the shape bbox, filtered to holes that fully fit inside.
 
     Same grid math and margin semantics as the panel face (`_hole_centers`):
@@ -624,6 +852,14 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
     that distance inward — same diameter, slightly off-grid — so letter edges
     stay readable. Nudged holes are rejected if they would come within one
     hole diameter (center-to-center, +5%) of another hole.
+
+    ``perimeter_row`` adds a corner-anchored, per-edge-justified hole ring
+    hugging every outline at exact clearance (see `contour_hole_centers`);
+    interior grid holes that would crowd the ring are excluded.
+
+    ``optimize_grid`` sweeps the grid phase (a 4×4 lattice of offsets plus
+    the default centered grid) and keeps the alignment that fits the most
+    holes — spacing is untouched, so there is zero visual cost.
     """
     if hole_dia <= 0 or pitch <= 0:
         raise ValueError("hole diameter and pitch must be positive")
@@ -642,22 +878,60 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
             f"(limit {MAX_GRID_CANDIDATES:,}). Increase the pitch or shrink the shape."
         )
 
-    raw = _hole_centers(x0, y0, w, h, hole_dia, pitch, pattern, stagger_angle, margin)
-    if not raw:
-        return InfillResult([], 0, 0)
     segs = _segment_arrays(shape.rings)
     clearance = margin + hole_dia / 2.0
 
-    pts = np.asarray(raw, dtype=float)
-    inside, min_d, _, _ = _classify_centers(pts, segs)
-    fits = inside & (min_d >= clearance)
-    holes = [(float(x), float(y)) for (x, y), ok in zip(raw, fits) if ok]
+    contour, dropped = [], 0
+    if perimeter_row:
+        contour, c_dropped = contour_hole_centers(shape, hole_dia, pitch, margin, nudge_max)
+        dropped += c_dropped
+    ring_pts = np.asarray(contour, dtype=float) if contour else None
+    # Grid holes must keep visual separation from the perimeter ring.
+    ring_excl = 0.8 * pitch
 
-    nudged, dropped = 0, 0
+    def _grid_eval(raw):
+        """(fits mask, inside, min_d, pts) for a candidate grid, ring-aware."""
+        if not raw:
+            return None
+        pts = np.asarray(raw, dtype=float)
+        inside, min_d, _, _ = _classify_centers(pts, segs)
+        fits = inside & (min_d >= clearance)
+        if ring_pts is not None and len(pts):
+            d2 = ((pts[:, None, 0] - ring_pts[None, :, 0]) ** 2
+                  + (pts[:, None, 1] - ring_pts[None, :, 1]) ** 2)
+            near_ring = np.min(d2, axis=1) < ring_excl * ring_excl
+        else:
+            near_ring = np.zeros(len(pts), dtype=bool)
+        return raw, pts, inside, min_d, fits & ~near_ring, near_ring
+
+    candidates = [_hole_centers(x0, y0, w, h, hole_dia, pitch, pattern, stagger_angle, margin)]
+    if optimize_grid:
+        row_step = pitch if pattern == "straight" else pitch * math.sin(math.radians(stagger_angle))
+        for i in range(4):
+            for j in range(4):
+                candidates.append(_grid_candidates(
+                    shape, hole_dia, pitch, pattern, stagger_angle, margin,
+                    phase=(pitch * i / 4.0, row_step * j / 4.0),
+                ))
+
+    best = None
+    for raw in candidates:
+        ev = _grid_eval(raw)
+        if ev is None:
+            continue
+        if best is None or int(np.sum(ev[4])) > int(np.sum(best[4])):
+            best = ev
+    if best is None:
+        return InfillResult(list(contour), 0, dropped, contour=len(contour))
+    raw, pts, inside, min_d, fits, near_ring = best
+
+    holes = list(contour) + [(float(x), float(y)) for (x, y), ok in zip(raw, fits) if ok]
+
+    nudged = 0
     if nudge_max > 0.0:
         signed = np.where(inside, min_d, -min_d)
         needed = clearance - signed
-        eligible = (~fits) & (needed <= nudge_max + 1e-9)
+        eligible = (~fits) & (~near_ring) & (needed <= nudge_max + 1e-9)
         min_cc = hole_dia * 1.05  # never let a nudged hole overlap a neighbor
         for i in np.nonzero(eligible)[0]:
             moved = _try_nudge(pts[i, 0], pts[i, 1], segs, clearance, nudge_max)
@@ -668,15 +942,20 @@ def infill_hole_centers(shape: ShapeGeometry, hole_dia: float, pitch: float,
             if any((mx - hx) ** 2 + (my - hy) ** 2 < min_cc * min_cc for hx, hy in holes):
                 dropped += 1
                 continue
+            if ring_pts is not None and len(ring_pts) and np.min(
+                (ring_pts[:, 0] - mx) ** 2 + (ring_pts[:, 1] - my) ** 2
+            ) < (ring_excl * ring_excl):
+                dropped += 1
+                continue
             holes.append((mx, my))
             nudged += 1
-        dropped += int(np.sum((~fits) & (needed > nudge_max + 1e-9) & (signed > -clearance)))
+        dropped += int(np.sum((~fits) & (~near_ring) & (needed > nudge_max + 1e-9) & (signed > -clearance)))
     if len(holes) > MAX_HOLES:
         raise ValueError(
             f"Pattern produced {len(holes):,} holes (limit {MAX_HOLES:,}). "
             "Increase the pitch or shrink the shape."
         )
-    return InfillResult(holes, nudged, dropped)
+    return InfillResult(holes, nudged, dropped, contour=len(contour))
 
 
 # ---------------------------------------------------------------------------

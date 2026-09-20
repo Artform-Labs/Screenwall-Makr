@@ -9,6 +9,7 @@ from shape_infill import (
     InfillResult,
     ShapeGeometry,
     build_infill_document,
+    contour_hole_centers,
     infill_hole_centers,
     load_shape,
     rings_from_dxf,
@@ -288,6 +289,83 @@ def test_infill_validation():
     with pytest.raises(ValueError, match="candidate holes"):
         infill_hole_centers(ShapeGeometry([_rect(0, 0, 5000, 5000)]),
                             0.05, 0.1, "staggered", 60.0, 0.1)
+
+
+def test_contour_row_rectangle_corners_and_edges():
+    shape = ShapeGeometry([_rect(0, 0, 10, 6)])
+    centers, dropped = contour_hole_centers(shape, 0.25, 0.75, 0.2)
+    clearance = 0.2 + 0.125
+    assert centers
+    # every ring hole hugs the boundary at exact clearance (within nudge tol)
+    for x, y in centers:
+        assert _min_boundary_dist(shape, x, y) == pytest.approx(clearance, abs=0.02)
+    # all four corners anchored: a hole near each corner's bisector point
+    for cx, cy in [(0, 0), (10, 0), (10, 6), (0, 6)]:
+        ex = cx + (clearance if cx == 0 else -clearance) * (1 if cx == 0 else 1)
+        assert any(math.hypot(x - cx, y - cy) <= clearance * math.sqrt(2) + 0.03
+                   for x, y in centers), f"no corner hole at {cx},{cy}"
+    # per-edge justified spacing: gaps along the bottom edge are uniform
+    bottom = sorted(x for x, y in centers if abs(y - clearance) < 0.02)
+    gaps = [b - a for a, b in zip(bottom, bottom[1:])]
+    assert max(gaps) - min(gaps) < 0.02
+    assert all(abs(g - 0.75) <= 0.75 * 0.5 for g in gaps)
+
+
+def test_contour_row_traces_smooth_void():
+    # donut: ring follows both the outer square and the circular counter
+    shape = ShapeGeometry([_rect(0, 0, 8, 8)])
+    import ezdxf as _e  # circle void via flattened ring
+    theta = [i * math.tau / 72 for i in range(72)]
+    void = [(4 + 1.5 * math.cos(t), 4 + 1.5 * math.sin(t)) for t in theta]
+    shape = ShapeGeometry([_rect(0, 0, 8, 8), void])
+    centers, _ = contour_hole_centers(shape, 0.25, 0.6, 0.15)
+    clearance = 0.15 + 0.125
+    near_void = [(x, y) for x, y in centers if 1.0 < math.hypot(x - 4, y - 4) < 2.2]
+    assert len(near_void) >= 10  # a ring of holes hugs the counter
+    for x, y in near_void:
+        # just outside the void at clearance
+        assert math.hypot(x - 4, y - 4) == pytest.approx(1.5 + clearance, abs=0.03)
+
+
+def test_perimeter_row_integrated_no_crowding():
+    shape = ShapeGeometry([[(0.0, 0.0), (9.0, 0.0), (0.0, 9.0)]])
+    res = infill_hole_centers(shape, 0.25, 0.6, "staggered", 60.0, 0.15,
+                              nudge_max=0.15, perimeter_row=True)
+    assert res.contour > 0
+    assert len(res.holes) > res.contour  # interior fill still present
+    clearance = 0.15 + 0.125
+    ring = res.holes[:res.contour]
+    grid = res.holes[res.contour:]
+    for x, y in res.holes:
+        assert _inside(shape, x, y)
+        assert _min_boundary_dist(shape, x, y) >= clearance - 1e-6
+    # grid holes keep visual separation from the ring
+    for gx, gy in grid:
+        dmin = min(math.hypot(gx - rx, gy - ry) for rx, ry in ring)
+        assert dmin >= 0.8 * 0.6 - 1e-9
+    # apex corner (sharpest point of the triangle) is anchored
+    assert any(math.hypot(x - 0, y - 9) < 1.2 for x, y in ring)
+
+
+def test_optimize_grid_never_worse_and_valid():
+    shape = ShapeGeometry([[(0.0, 0.0), (9.0, 0.0), (0.0, 9.0)]])
+    kw = dict(hole_dia=0.5, pitch=0.6, pattern="straight", stagger_angle=60.0, margin=0.25)
+    default = infill_hole_centers(shape, **kw)
+    optimized = infill_hole_centers(shape, **kw, optimize_grid=True)
+    assert len(optimized.holes) >= len(default.holes)
+    clearance = 0.25 + 0.25
+    for x, y in optimized.holes:
+        assert _inside(shape, x, y)
+        assert _min_boundary_dist(shape, x, y) >= clearance - 1e-6
+    # spacing untouched: all pairwise x-deltas within a row are multiples of pitch
+    rows = {}
+    for x, y in optimized.holes:
+        rows.setdefault(round(y, 6), []).append(x)
+    for xs in rows.values():
+        xs = sorted(xs)
+        for a, b in zip(xs, xs[1:]):
+            k = (b - a) / 0.6
+            assert abs(k - round(k)) < 1e-6
 
 
 def test_scale_rings():

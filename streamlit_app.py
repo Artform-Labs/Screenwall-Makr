@@ -549,8 +549,11 @@ st.caption(
     "logos, arbitrary polygons — and fill them with the same straight / staggered "
     "hole pattern the panels use. One file can hold many graphics (a whole word); "
     "interior voids like the counter of an *O* stay empty. Every hole keeps the "
-    "edge margin from the outline; **edge nudge** lets an almost-fitting hole "
-    "slide slightly inward (same Ø, capped shift) so glyph edges read cleanly. "
+    "edge margin from the outline. For crisp letterforms: the **perimeter outline "
+    "row** traces each outline with corner-anchored holes at per-edge-justified "
+    "spacing, **auto-align grid** slides the fill grid (never its spacing) to fit "
+    "the most holes, and **edge nudge** lets an almost-fitting hole slide slightly "
+    "inward (same Ø, capped shift). "
     "Convert text to outlines before export (Illustrator: Type → Create Outlines). "
     "EPS isn't supported — use SVG, PDF, or PDF-compatible .ai instead."
 )
@@ -579,6 +582,21 @@ if shape_uploads:
                  "Same hole size, slightly off-grid. 0 disables.",
         )
     s_nudge = s_pitch * s_nudge_pct / 100.0
+    t1, t2, _sp = st.columns([1.4, 1.2, 3])
+    with t1:
+        s_perimeter = st.checkbox(
+            "Perimeter outline row", value=True,
+            help="Trace every outline with a dedicated row of holes at exact edge "
+                 "margin: sharp corners always get a hole, and spacing is justified "
+                 "per edge (evenly stretched a few % per side) so the form reads "
+                 "crisply. Interior grid holes that would crowd the row are removed.",
+        )
+    with t2:
+        s_optimize = st.checkbox(
+            "Auto-align grid", value=True,
+            help="Slides the interior grid alignment (never the spacing) to the "
+                 "position that fits the most holes inside the shape.",
+        )
 
 for shape_file in shape_uploads or []:
     fkey = shape_file.name
@@ -637,9 +655,12 @@ for shape_file in shape_uploads or []:
 
             ew, eh = shape.extents
             result = infill_hole_centers(
-                shape, s_hole_dia, s_pitch, s_pattern, s_angle, s_margin, nudge_max=s_nudge
+                shape, s_hole_dia, s_pitch, s_pattern, s_angle, s_margin,
+                nudge_max=s_nudge, perimeter_row=s_perimeter, optimize_grid=s_optimize,
             )
             nudge_note = (
+                f" · **Perimeter row:** {result.contour}" if result.contour else ""
+            ) + (
                 f" · **Nudged in to fit:** {result.nudged}" if result.nudged else ""
             ) + (
                 f" · **Dropped at edge:** {result.dropped}" if result.dropped else ""
